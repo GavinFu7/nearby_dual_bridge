@@ -1,3 +1,11 @@
 ## 0.0.1
 
-* TODO: Describe initial release.
+* Initial release of `nearby_dual_bridge` for Android, iOS, and macOS.
+* Add `DualBridgeManager` unified Host / Client API over Wi-Fi and BLE.
+* Wi-Fi: mDNS register/discover via `nsd`, data plane via `dart:io` WebSocket.
+* BLE: dual-role Central / Peripheral via `bluetooth_low_energy`, with chunked JSON framing.
+* Merge discovered Hosts that expose both Wi-Fi and BLE endpoints into one `BridgeDevice`.
+* Connection preference: prefer Wi-Fi (default), prefer BLE, or force a single transport.
+* Example app with Host / Client controls, Wi-Fi-only / BLE-only scan, and platform permissions.
+* Fix scan stream race that dropped discovered devices before they reached the UI.
+* Prefer mDNS hostname / IPv4 for WebSocket connect; skip link-local IPv6 that caused connection refused.
