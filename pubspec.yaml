@@ -1,8 +1,5 @@
 name: nearby_dual_bridge
-description: >
-  Cross-platform dual-role nearby bridge for Android, iOS, and macOS.
-  Each device can dynamically act as Host or Client over Wi-Fi (mDNS + WebSocket)
-  and BLE (Central / Peripheral).
+description: "A cross-platform, dual-role proximity bridge. It can dynamically act as a host or client via Wi-Fi (mDNS + WebSocket) and connect via BLE (center/peripheral)."
 version: 0.0.1
 homepage:
 
