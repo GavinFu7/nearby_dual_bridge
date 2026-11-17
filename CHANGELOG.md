@@ -7,5 +7,3 @@
 * Merge discovered Hosts that expose both Wi-Fi and BLE endpoints into one `BridgeDevice`.
 * Connection preference: prefer Wi-Fi (default), prefer BLE, or force a single transport.
 * Example app with Host / Client controls, Wi-Fi-only / BLE-only scan, and platform permissions.
-* Fix scan stream race that dropped discovered devices before they reached the UI.
-* Prefer mDNS hostname / IPv4 for WebSocket connect; skip link-local IPv6 that caused connection refused.
