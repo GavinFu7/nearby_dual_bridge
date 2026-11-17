@@ -1,10 +1,12 @@
 import '../models/bridge_device.dart';
+import '../models/bridge_peer_event.dart';
 import '../models/wifi_endpoint.dart';
 
 /// Abstraction for Wi-Fi discovery (mDNS) and data plane (HttpServer / WebSocket).
-///
-/// Concrete implementation will use `nsd` + `dart:io` in a later phase.
 abstract class WifiTransport {
+  /// Peer socket connect / disconnect events.
+  Stream<BridgePeerEvent> get onPeerConnectionChanged;
+
   /// Start local WebSocket server and register mDNS service.
   Future<WifiEndpoint> startHost({
     required String deviceName,

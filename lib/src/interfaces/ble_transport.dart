@@ -1,10 +1,11 @@
 import '../models/ble_endpoint.dart';
 import '../models/bridge_device.dart';
+import '../models/bridge_peer_event.dart';
 
 /// Abstraction for BLE dual-role transport (Peripheral Host + Central Client).
-///
-/// Concrete implementation will use `bluetooth_low_energy` in a later phase.
 abstract class BleTransport {
+  /// Peer BLE link connect / disconnect events.
+  Stream<BridgePeerEvent> get onPeerConnectionChanged;
   /// Start GATT service + advertising as Peripheral (Host).
   Future<void> startHost({
     required String deviceName,

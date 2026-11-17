@@ -8,6 +8,8 @@ import '../bridge_constants.dart';
 import '../interfaces/ble_transport.dart';
 import '../models/ble_endpoint.dart';
 import '../models/bridge_device.dart';
+import '../models/bridge_peer_event.dart';
+import '../models/transport_type.dart';
 import '../protocol/ble_chunk_protocol.dart';
 
 /// BLE dual-role transport via `bluetooth_low_energy`.
@@ -26,6 +28,7 @@ class BleTransportImpl implements BleTransport {
 
   final _messageController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final _peerController = StreamController<BridgePeerEvent>.broadcast();
   final _hostReassembler = BleChunkReassembler();
   final _clientReassembler = BleChunkReassembler();
 
@@ -34,6 +37,7 @@ class BleTransportImpl implements BleTransport {
   StreamSubscription? _writeSub;
   StreamSubscription? _notifyStateSub;
   StreamSubscription? _centralNotifiedSub;
+  StreamSubscription? _centralConnectionSub;
 
   GATTCharacteristic? _hostCharacteristic;
   final _subscribedCentrals = <Central>{};
@@ -42,10 +46,15 @@ class BleTransportImpl implements BleTransport {
   String? _filterUuid;
   bool _hosting = false;
   bool _scanning = false;
+  bool _closingLink = false;
 
   @override
   Stream<Map<String, dynamic>> get onMessageReceived =>
       _messageController.stream;
+
+  @override
+  Stream<BridgePeerEvent> get onPeerConnectionChanged =>
+      _peerController.stream;
 
   @override
   Future<void> startHost({
@@ -107,9 +116,15 @@ class BleTransportImpl implements BleTransport {
         _peripheral.characteristicNotifyStateChanged.listen((event) {
       if (event.characteristic.uuid != charUuid) return;
       if (event.state) {
-        _subscribedCentrals.add(event.central);
+        final added = _subscribedCentrals.add(event.central);
+        if (added) {
+          _emitPeer(BridgePeerEventType.connected);
+        }
       } else {
-        _subscribedCentrals.remove(event.central);
+        final removed = _subscribedCentrals.remove(event.central);
+        if (removed) {
+          _emitPeer(BridgePeerEventType.disconnected);
+        }
       }
     });
 
@@ -243,8 +258,21 @@ class BleTransportImpl implements BleTransport {
       );
     }
 
+    await _centralConnectionSub?.cancel();
+    _centralConnectionSub = _central.connectionStateChanged.listen((event) {
+      if (event.peripheral != resolved) return;
+      if (event.state == ConnectionState.disconnected) {
+        _connectedPeripheral = null;
+        _clientCharacteristic = null;
+        if (!_closingLink) {
+          _emitPeer(BridgePeerEventType.disconnected);
+        }
+      }
+    });
+
     await _central.connect(resolved);
     _connectedPeripheral = resolved;
+    _emitPeer(BridgePeerEventType.connected);
 
     final services = await _central.discoverGATT(resolved);
     final resolvedServiceUuid =
@@ -299,8 +327,16 @@ class BleTransportImpl implements BleTransport {
     _clientCharacteristic = null;
     _clientReassembler.reset();
     if (peripheral != null) {
-      await _central.disconnect(peripheral);
+      _closingLink = true;
+      try {
+        await _central.disconnect(peripheral);
+      } finally {
+        _closingLink = false;
+      }
+      _emitPeer(BridgePeerEventType.disconnected);
     }
+    await _centralConnectionSub?.cancel();
+    _centralConnectionSub = null;
   }
 
   @override
@@ -384,6 +420,23 @@ class BleTransportImpl implements BleTransport {
     await stopHost();
     await disconnect();
     await _messageController.close();
+    await _peerController.close();
+  }
+
+  int get _peerCount {
+    if (_connectedPeripheral != null) return 1;
+    return _subscribedCentrals.length;
+  }
+
+  void _emitPeer(BridgePeerEventType type) {
+    if (_peerController.isClosed) return;
+    _peerController.add(
+      BridgePeerEvent(
+        transport: TransportType.ble,
+        type: type,
+        peerCount: _peerCount,
+      ),
+    );
   }
 
   Future<void> _ensureReady(BluetoothLowEnergyManager manager) async {

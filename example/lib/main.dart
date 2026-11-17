@@ -2,13 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:nearby_dual_bridge/nearby_dual_bridge.dart';
-import 'package:nsd/nsd.dart' show LogTopic, enableLogging;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  // Help diagnose mDNS discovery on device consoles / Xcode.
-  enableLogging(LogTopic.errors);
-  enableLogging(LogTopic.calls);
   runApp(const NearbyDualBridgeExampleApp());
 }
 
@@ -48,6 +44,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   );
   final _messageController = TextEditingController();
   final _logs = <String>[];
+  final _scrollController = ScrollController();
 
   BridgeRole _role = BridgeRole.idle;
   BridgeConnectionState _connectionState = BridgeConnectionState.disconnected;
@@ -56,23 +53,50 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
 
   bool _hosting = false;
   bool _scanning = false;
+  bool _busy = false;
   List<BridgeDevice> _devices = const [];
   StreamSubscription? _scanSub;
   StreamSubscription? _messageSub;
-  StreamSubscription? _roleSub;
-  StreamSubscription? _connectionSub;
+  StreamSubscription? _statusSub;
+  int _peerCount = 0;
 
   @override
   void initState() {
     super.initState();
-    _roleSub = _bridge.onRoleChanged.listen((role) {
-      setState(() => _role = role);
-    });
-    _connectionSub = _bridge.onConnectionStateChanged.listen((state) {
+    _statusSub = _bridge.addStatusListener((status) {
       setState(() {
-        _connectionState = state;
-        _activeTransport = _bridge.activeTransport;
+        _role = status.role;
+        _connectionState = status.connectionState;
+        _activeTransport = status.activeTransport;
+        _peerCount = status.peerCount;
+        if (status.role == BridgeRole.host) {
+          _hosting = true;
+        } else if (status.reason == 'host_stopped') {
+          _hosting = false;
+        }
       });
+      final reason = status.reason;
+      if (reason == null) return;
+      switch (reason) {
+        case 'peer_connected':
+          _appendLog(
+            'Status: peer connected · peers=${status.peerCount} '
+            '· ${status.activeTransport?.name ?? status.role.name}',
+          );
+        case 'peer_disconnected':
+          _appendLog(
+            'Status: peer disconnected · peers=${status.peerCount} '
+            '· connection=${status.connectionState.name}',
+          );
+        case 'connected':
+          _appendLog('Status: connected via ${status.activeTransport?.name}');
+        case 'disconnected':
+        case 'connect_failed':
+        case 'host_stopped':
+          _appendLog('Status: $reason');
+        default:
+          break;
+      }
     });
     _messageSub = _bridge.onMessageReceived.listen((message) {
       _appendLog('← $message');
@@ -100,12 +124,12 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   void dispose() {
     unawaited(_scanSub?.cancel());
     unawaited(_messageSub?.cancel());
-    unawaited(_roleSub?.cancel());
-    unawaited(_connectionSub?.cancel());
+    unawaited(_statusSub?.cancel());
     unawaited(_bridge.dispose());
     _deviceNameController.dispose();
     _serviceUuidController.dispose();
     _messageController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
@@ -113,78 +137,94 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
 
   String get _deviceName => _deviceNameController.text.trim();
 
-  Future<void> _toggleHost() async {
+  Future<void> _runBusy(Future<void> Function() action) async {
+    if (_busy) return;
+    setState(() => _busy = true);
     try {
-      if (_hosting) {
-        await _bridge.stopHost();
-        setState(() => _hosting = false);
-        _appendLog('Host stopped');
-        return;
-      }
-      if (_deviceName.isEmpty) {
-        _appendLog('Device name is required');
-        return;
-      }
-      await _stopScan();
-      final session = await _bridge.startHost(
-        deviceName: _deviceName,
-        serviceUuid: _serviceUuid,
-      );
-      setState(() => _hosting = true);
-      _appendLog(
-        'Host OK · Wi-Fi ${session.wifi.host}:${session.wifi.port} · '
-        'mDNS ${BridgeConstants.mdnsServiceType}',
-      );
-      if (session.bleAdvertising) {
-        _appendLog('BLE advertising OK (name may be truncated to 8 chars)');
-      } else {
-        _appendLog('BLE advertising FAILED: ${session.bleError}');
-        _appendLog('Wi-Fi Host is still running — you can test mDNS first');
-      }
-    } catch (error) {
-      _appendLog('Host error: $error');
+      await action();
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _toggleScan({bool wifi = true, bool ble = true}) async {
-    try {
-      if (_scanning) {
+  Future<void> _toggleHost() async {
+    await _runBusy(() async {
+      try {
+        if (_hosting) {
+          await _bridge.stopHost();
+          setState(() => _hosting = false);
+          _appendLog('Host stopped');
+          return;
+        }
+        if (_deviceName.isEmpty) {
+          _appendLog('Device name is required');
+          return;
+        }
         await _stopScan();
-        return;
+        final session = await _bridge.startHost(
+          deviceName: _deviceName,
+          serviceUuid: _serviceUuid,
+        );
+        setState(() => _hosting = true);
+        _appendLog(
+          'Host OK · Wi-Fi ${session.wifi.host}:${session.wifi.port} · '
+          'mDNS ${BridgeConstants.mdnsServiceType}',
+        );
+        if (session.bleAdvertising) {
+          _appendLog('BLE advertising OK (name may be truncated to 8 chars)');
+        } else {
+          _appendLog('BLE advertising FAILED: ${session.bleError}');
+          _appendLog('Wi-Fi Host is still running — you can test mDNS first');
+        }
+      } catch (error) {
+        _appendLog('Host error: $error');
       }
-      if (_hosting) {
-        _appendLog('Stop Host before scanning as Client');
-        return;
+    });
+  }
+
+  Future<void> _toggleScan({bool wifi = true, bool ble = true}) async {
+    await _runBusy(() async {
+      try {
+        if (_scanning) {
+          await _stopScan();
+          _appendLog('Scan stopped');
+          return;
+        }
+        if (_hosting) {
+          _appendLog('Stop Host before scanning as Client');
+          return;
+        }
+        FocusScope.of(context).unfocus();
+        setState(() {
+          _scanning = true;
+          _devices = const [];
+        });
+        final mode = [
+          if (wifi) 'Wi-Fi',
+          if (ble) 'BLE',
+        ].join('+');
+        var lastCount = -1;
+        _scanSub = _bridge
+            .scanHosts(serviceUuid: _serviceUuid, wifi: wifi, ble: ble)
+            .listen(
+          (devices) {
+            setState(() => _devices = devices);
+            if (devices.length != lastCount) {
+              lastCount = devices.length;
+              _appendLog('Found ${devices.length} host(s) [$mode]');
+            }
+          },
+          onError: (Object error) => _appendLog('Scan error: $error'),
+        );
+        _appendLog(
+          'Scanning $mode for $_serviceUuid … '
+          '(allow Local Network for this app)',
+        );
+      } catch (error) {
+        setState(() => _scanning = false);
+        _appendLog('Scan error: $error');
       }
-      setState(() {
-        _scanning = true;
-        _devices = const [];
-      });
-      final mode = [
-        if (wifi) 'Wi-Fi',
-        if (ble) 'BLE',
-      ].join('+');
-      var lastCount = -1;
-      _scanSub = _bridge
-          .scanHosts(serviceUuid: _serviceUuid, wifi: wifi, ble: ble)
-          .listen(
-        (devices) {
-          setState(() => _devices = devices);
-          if (devices.length != lastCount) {
-            lastCount = devices.length;
-            _appendLog('Found ${devices.length} host(s) [$mode]');
-          }
-        },
-        onError: (Object error) => _appendLog('Scan error: $error'),
-      );
-      _appendLog(
-        'Scanning $mode for $_serviceUuid … '
-        '(iPhone: allow Local Network for this app)',
-      );
-    } catch (error) {
-      setState(() => _scanning = false);
-      _appendLog('Scan error: $error');
-    }
+    });
   }
 
   Future<void> _stopScan() async {
@@ -197,24 +237,29 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   }
 
   Future<void> _connect(BridgeDevice device) async {
-    try {
-      await _stopScan();
-      await _bridge.connect(device, preference: _preference);
-      _appendLog(
-        'Connected to ${device.name} via ${_bridge.activeTransport?.name}',
-      );
-    } catch (error) {
-      _appendLog('Connect error: $error');
-    }
+    await _runBusy(() async {
+      try {
+        FocusScope.of(context).unfocus();
+        await _stopScan();
+        await _bridge.connect(device, preference: _preference);
+        _appendLog(
+          'Connected to ${device.name} via ${_bridge.activeTransport?.name}',
+        );
+      } catch (error) {
+        _appendLog('Connect error: $error');
+      }
+    });
   }
 
   Future<void> _disconnect() async {
-    try {
-      await _bridge.disconnect();
-      _appendLog('Disconnected');
-    } catch (error) {
-      _appendLog('Disconnect error: $error');
-    }
+    await _runBusy(() async {
+      try {
+        await _bridge.disconnect();
+        _appendLog('Disconnected');
+      } catch (error) {
+        _appendLog('Disconnect error: $error');
+      }
+    });
   }
 
   Future<void> _send() async {
@@ -236,8 +281,6 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   }
 
   void _appendLog(String line) {
-    // ignore: avoid_print
-    print('[NDB] $line');
     if (!mounted) return;
     final stamp = TimeOfDay.now().format(context);
     setState(() {
@@ -251,203 +294,265 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Nearby Dual Bridge'),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: Center(
-              child: Text(
-                _role.name.toUpperCase(),
-                style: TextStyle(
-                  color: scheme.primary,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _StatusBanner(
-            role: _role,
-            connectionState: _connectionState,
-            activeTransport: _activeTransport,
-            hosting: _hosting,
-            scanning: _scanning,
-          ),
-          const SizedBox(height: 16),
-          TextField(
-            controller: _deviceNameController,
-            decoration: const InputDecoration(
-              labelText: 'Device name',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _serviceUuidController,
-            decoration: const InputDecoration(
-              labelText: 'Service UUID',
-              border: OutlineInputBorder(),
-              helperText: 'Must match on Host and Client',
-            ),
-          ),
-          const SizedBox(height: 16),
-          Text('Mode', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              FilledButton.icon(
-                onPressed: _toggleHost,
-                icon: Icon(_hosting ? Icons.stop : Icons.podcasts),
-                label: Text(_hosting ? 'Stop Host' : 'Start Host'),
-              ),
-              FilledButton.tonalIcon(
-                onPressed: _hosting
-                    ? null
-                    : () => _toggleScan(wifi: true, ble: true),
-                icon: Icon(_scanning ? Icons.search_off : Icons.search),
-                label: Text(_scanning ? 'Stop Scan' : 'Scan Both'),
-              ),
-              OutlinedButton.icon(
-                onPressed: _hosting || _scanning
-                    ? null
-                    : () => _toggleScan(wifi: true, ble: false),
-                icon: const Icon(Icons.wifi_find),
-                label: const Text('Scan Wi-Fi only'),
-              ),
-              OutlinedButton.icon(
-                onPressed: _hosting || _scanning
-                    ? null
-                    : () => _toggleScan(wifi: false, ble: true),
-                icon: const Icon(Icons.bluetooth_searching),
-                label: const Text('Scan BLE only'),
-              ),
-              if (_connectionState == BridgeConnectionState.connected)
-                OutlinedButton.icon(
-                  onPressed: _disconnect,
-                  icon: const Icon(Icons.link_off),
-                  label: const Text('Disconnect'),
-                ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Text(
-            'Connection preference',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          SegmentedButton<ConnectionPreference>(
-            segments: const [
-              ButtonSegment(
-                value: ConnectionPreference.preferWifi,
-                label: Text('Prefer Wi-Fi'),
-                icon: Icon(Icons.wifi),
-              ),
-              ButtonSegment(
-                value: ConnectionPreference.preferBle,
-                label: Text('Prefer BLE'),
-                icon: Icon(Icons.bluetooth),
-              ),
-              ButtonSegment(
-                value: ConnectionPreference.wifiOnly,
-                label: Text('Wi-Fi only'),
-              ),
-              ButtonSegment(
-                value: ConnectionPreference.bleOnly,
-                label: Text('BLE only'),
-              ),
-            ],
-            selected: {_preference},
-            onSelectionChanged: (value) {
-              setState(() => _preference = value.first);
-            },
-          ),
-          const SizedBox(height: 20),
-          Text(
-            'Discovered hosts (${_devices.length})',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          if (_devices.isEmpty)
-            const Card(
-              child: ListTile(
-                leading: Icon(Icons.devices_other),
-                title: Text('No hosts yet'),
-                subtitle: Text('Start Host on another device, then Scan'),
-              ),
-            )
-          else
-            ..._devices.map(
-              (device) => Card(
-                child: ListTile(
-                  title: Text(device.name),
-                  subtitle: Text(
-                    [
-                      if (device.supportsWifi)
-                        'Wi-Fi ${device.wifi!.host}:${device.wifi!.port}',
-                      if (device.supportsBle)
-                        'BLE ${device.ble!.rssi ?? '-'} dBm',
-                    ].join(' · '),
+    final width = MediaQuery.sizeOf(context).width;
+    final maxContentWidth = width >= 900 ? 720.0 : double.infinity;
+
+    return GestureDetector(
+      onTap: () => FocusScope.of(context).unfocus(),
+      behavior: HitTestBehavior.deferToChild,
+      child: Scaffold(
+        resizeToAvoidBottomInset: true,
+        appBar: AppBar(
+          title: const Text('Nearby Dual Bridge'),
+          actions: [
+            if (_busy)
+              const Padding(
+                padding: EdgeInsets.only(right: 8),
+                child: Center(
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
                   ),
-                  trailing: FilledButton(
-                    onPressed: () => _connect(device),
-                    child: const Text('Connect'),
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: Center(
+                child: Text(
+                  _role.name.toUpperCase(),
+                  style: TextStyle(
+                    color: scheme.primary,
+                    fontWeight: FontWeight.w700,
                   ),
-                  isThreeLine: true,
                 ),
               ),
             ),
-          const SizedBox(height: 20),
-          Text('Messages', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _messageController,
+          ],
+        ),
+        body: Align(
+          alignment: Alignment.topCenter,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxContentWidth),
+            child: ListView(
+              controller: _scrollController,
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+              children: [
+                _StatusBanner(
+                  role: _role,
+                  connectionState: _connectionState,
+                  activeTransport: _activeTransport,
+                  hosting: _hosting,
+                  scanning: _scanning,
+                  peerCount: _peerCount,
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _deviceNameController,
+                  textInputAction: TextInputAction.next,
                   decoration: const InputDecoration(
-                    hintText: 'JSON chat text…',
+                    labelText: 'Device name',
                     border: OutlineInputBorder(),
                   ),
-                  onSubmitted: (_) => _send(),
                 ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(onPressed: _send, child: const Text('Send')),
-            ],
-          ),
-          const SizedBox(height: 12),
-          SizedBox(
-            height: 220,
-            child: Card(
-              child: ListView.builder(
-                padding: const EdgeInsets.all(12),
-                itemCount: _logs.length,
-                itemBuilder: (context, index) {
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 6),
-                    child: Text(
-                      _logs[index],
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 12,
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _serviceUuidController,
+                  textInputAction: TextInputAction.done,
+                  decoration: const InputDecoration(
+                    labelText: 'Service UUID',
+                    border: OutlineInputBorder(),
+                    helperText: 'Must match on Host and Client',
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text('Mode', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _busy ? null : _toggleHost,
+                      icon: Icon(_hosting ? Icons.stop : Icons.podcasts),
+                      label: Text(_hosting ? 'Stop Host' : 'Start Host'),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: (_busy || _hosting)
+                          ? null
+                          : () => _toggleScan(wifi: true, ble: true),
+                      icon: Icon(_scanning ? Icons.search_off : Icons.search),
+                      label: Text(_scanning ? 'Stop Scan' : 'Scan Both'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: (_busy || _hosting || _scanning)
+                          ? null
+                          : () => _toggleScan(wifi: true, ble: false),
+                      icon: const Icon(Icons.wifi_find),
+                      label: const Text('Scan Wi-Fi only'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: (_busy || _hosting || _scanning)
+                          ? null
+                          : () => _toggleScan(wifi: false, ble: true),
+                      icon: const Icon(Icons.bluetooth_searching),
+                      label: const Text('Scan BLE only'),
+                    ),
+                    if (_connectionState == BridgeConnectionState.connected)
+                      OutlinedButton.icon(
+                        onPressed: _busy ? null : _disconnect,
+                        icon: const Icon(Icons.link_off),
+                        label: const Text('Disconnect'),
+                      ),
+                  ],
+                ),
+                if (_scanning) ...[
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: _busy ? null : () => _toggleScan(),
+                      icon: const Icon(Icons.stop_circle_outlined),
+                      label: const Text('Stop Scan'),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 16),
+                Text(
+                  'Connection preference',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final option in ConnectionPreference.values)
+                      ChoiceChip(
+                        label: Text(_preferenceLabel(option)),
+                        selected: _preference == option,
+                        onSelected: _busy
+                            ? null
+                            : (_) => setState(() => _preference = option),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  'Discovered hosts (${_devices.length})',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 8),
+                if (_devices.isEmpty)
+                  const Card(
+                    child: ListTile(
+                      leading: Icon(Icons.devices_other),
+                      title: Text('No hosts yet'),
+                      subtitle: Text(
+                        'Start Host on another device, then Scan. '
+                        'On iPad: Settings → Privacy → Local Network → enable this app.',
                       ),
                     ),
-                  );
-                },
-              ),
+                  )
+                else
+                  ..._devices.map((device) {
+                    return Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              device.name,
+                              style: Theme.of(context).textTheme.titleMedium,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              [
+                                if (device.supportsWifi)
+                                  'Wi-Fi ${device.wifi!.host}:${device.wifi!.port}',
+                                if (device.supportsBle)
+                                  'BLE ${device.ble!.rssi ?? '-'} dBm',
+                              ].join(' · '),
+                            ),
+                            const SizedBox(height: 12),
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: FilledButton(
+                                onPressed:
+                                    _busy ? null : () => _connect(device),
+                                child: const Text('Connect'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }),
+                const SizedBox(height: 20),
+                Text('Messages', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _messageController,
+                        textInputAction: TextInputAction.send,
+                        decoration: const InputDecoration(
+                          hintText: 'JSON chat text…',
+                          border: OutlineInputBorder(),
+                        ),
+                        onSubmitted: (_) => _send(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: _busy ? null : _send,
+                      child: const Text('Send'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Text('Log', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: _logs.isEmpty
+                        ? const Text('No messages yet')
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              for (final line in _logs.take(30))
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 6),
+                                  child: SelectableText(
+                                    line,
+                                    style: const TextStyle(
+                                      fontFamily: 'monospace',
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                  ),
+                ),
+              ],
             ),
           ),
-        ],
+        ),
       ),
     );
+  }
+
+  String _preferenceLabel(ConnectionPreference preference) {
+    return switch (preference) {
+      ConnectionPreference.preferWifi => 'Prefer Wi-Fi',
+      ConnectionPreference.preferBle => 'Prefer BLE',
+      ConnectionPreference.wifiOnly => 'Wi-Fi only',
+      ConnectionPreference.bleOnly => 'BLE only',
+    };
   }
 }
 
@@ -458,6 +563,7 @@ class _StatusBanner extends StatelessWidget {
     required this.activeTransport,
     required this.hosting,
     required this.scanning,
+    required this.peerCount,
   });
 
   final BridgeRole role;
@@ -465,6 +571,7 @@ class _StatusBanner extends StatelessWidget {
   final TransportType? activeTransport;
   final bool hosting;
   final bool scanning;
+  final int peerCount;
 
   @override
   Widget build(BuildContext context) {
@@ -494,6 +601,7 @@ class _StatusBanner extends StatelessWidget {
           Text(
             'Role: ${role.name} · Connection: ${connectionState.name}'
             '${activeTransport == null ? '' : ' · ${activeTransport!.name}'}'
+            ' · peers: $peerCount'
             '${hosting ? ' · advertising' : ''}'
             '${scanning ? ' · scanning' : ''}',
           ),

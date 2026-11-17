@@ -279,7 +279,7 @@ packages:
     source: hosted
     version: "1.0.0"
   nsd:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: nsd
       sha256: "2551fec29f6032459815a577f385f89e18099a3ca1c545b5dfb1e1a64b5705ec"

@@ -6,13 +6,14 @@ import 'interfaces/bridge_permissions.dart';
 import 'interfaces/wifi_transport.dart';
 import 'models/bridge_connection_state.dart';
 import 'models/bridge_device.dart';
+import 'models/bridge_peer_event.dart';
 import 'models/bridge_role.dart';
+import 'models/bridge_status.dart';
 import 'models/connection_preference.dart';
 import 'models/host_session.dart';
 import 'models/transport_type.dart';
 import 'permissions/bridge_permissions_impl.dart';
 import 'wifi/wifi_transport_impl.dart';
-
 
 /// Unified Host/Client API over Wi-Fi (mDNS + WebSocket) and BLE.
 class DualBridgeManager {
@@ -25,6 +26,8 @@ class DualBridgeManager {
         _permissions = permissions ?? BridgePermissionsImpl() {
     _wifiMessageSub = _wifi.onMessageReceived.listen(_messageController.add);
     _bleMessageSub = _ble.onMessageReceived.listen(_messageController.add);
+    _wifiPeerSub = _wifi.onPeerConnectionChanged.listen(_onWifiPeerEvent);
+    _blePeerSub = _ble.onPeerConnectionChanged.listen(_onBlePeerEvent);
   }
 
   final WifiTransport _wifi;
@@ -36,9 +39,12 @@ class DualBridgeManager {
   final _connectionStateController =
       StreamController<BridgeConnectionState>.broadcast();
   final _roleController = StreamController<BridgeRole>.broadcast();
+  final _statusController = StreamController<BridgeStatus>.broadcast();
 
   StreamSubscription? _wifiMessageSub;
   StreamSubscription? _bleMessageSub;
+  StreamSubscription? _wifiPeerSub;
+  StreamSubscription? _blePeerSub;
   StreamSubscription? _wifiScanSub;
   StreamSubscription? _bleScanSub;
   StreamController<List<BridgeDevice>>? _scanController;
@@ -46,6 +52,9 @@ class DualBridgeManager {
   BridgeRole _role = BridgeRole.idle;
   BridgeConnectionState _connectionState = BridgeConnectionState.disconnected;
   TransportType? _activeTransport;
+  int _wifiPeers = 0;
+  int _blePeers = 0;
+  bool _localDisconnect = false;
 
   BridgeRole get role => _role;
 
@@ -54,14 +63,37 @@ class DualBridgeManager {
   /// Transport used by the active Client connection, if any.
   TransportType? get activeTransport => _activeTransport;
 
+  /// Current status snapshot.
+  BridgeStatus get status => BridgeStatus(
+        role: _role,
+        connectionState: _connectionState,
+        activeTransport: _activeTransport,
+        peerCount: _peerCount,
+      );
+
   Stream<BridgeRole> get onRoleChanged => _roleController.stream;
 
   Stream<BridgeConnectionState> get onConnectionStateChanged =>
       _connectionStateController.stream;
 
+  /// Fires on role / connection / peer-count changes (including unexpected drops).
+  Stream<BridgeStatus> get onStatusChanged => _statusController.stream;
+
   /// Unified inbound JSON messages from the peer (Host↔Client).
   Stream<Map<String, dynamic>> get onMessageReceived =>
       _messageController.stream;
+
+  /// Convenience listener; emits the current [status] immediately, then updates.
+  StreamSubscription<BridgeStatus> addStatusListener(
+    void Function(BridgeStatus status) listener,
+  ) {
+    scheduleMicrotask(() {
+      if (!_statusController.isClosed) {
+        listener(status);
+      }
+    });
+    return _statusController.stream.listen(listener);
+  }
 
   /// Start Host mode: local WebSocket server + mDNS + BLE Peripheral advertising.
   ///
@@ -100,7 +132,7 @@ class DualBridgeManager {
       bleError = error;
     }
 
-    _setRole(BridgeRole.host);
+    _setRole(BridgeRole.host, reason: 'host_started');
     return HostSession(
       wifi: wifi,
       bleAdvertising: bleAdvertising,
@@ -110,11 +142,19 @@ class DualBridgeManager {
 
   /// Stop Host mode and tear down all advertisements / servers.
   Future<void> stopHost() async {
-    await _ble.stopHost();
-    await _wifi.stopHost();
-    if (_role == BridgeRole.host) {
-      _setRole(BridgeRole.idle);
+    _localDisconnect = true;
+    try {
+      await _ble.stopHost();
+      await _wifi.stopHost();
+    } finally {
+      _localDisconnect = false;
     }
+    _wifiPeers = 0;
+    _blePeers = 0;
+    if (_role == BridgeRole.host) {
+      _setRole(BridgeRole.idle, reason: 'host_stopped');
+    }
+    _emitStatus(reason: 'host_stopped');
   }
 
   /// Scan for Hosts via mDNS and/or BLE Central, filtered by [serviceUuid].
@@ -152,15 +192,12 @@ class DualBridgeManager {
       emit();
     }
 
-    void softError(String transport, Object error, StackTrace stackTrace) {
-      // Keep the merged scan stream alive when one transport fails.
-      // ignore: avoid_print
-      print('nearby_dual_bridge $transport scan error: $error');
-    }
+    // Per-transport scan errors are swallowed so the other transport can
+    // keep emitting results.
+    void ignoreTransportError(Object error, StackTrace stackTrace) {}
 
     controller = StreamController<List<BridgeDevice>>(
       onListen: () async {
-        // Tear down previous transport scans without closing this controller.
         await _stopTransportScans();
 
         final granted = await _permissions.ensureScanPermissions();
@@ -175,7 +212,7 @@ class DualBridgeManager {
         }
 
         if (_role != BridgeRole.host) {
-          _setRole(BridgeRole.client);
+          _setRole(BridgeRole.client, reason: 'scan_started');
         }
 
         var started = 0;
@@ -185,12 +222,11 @@ class DualBridgeManager {
           try {
             _wifiScanSub = _wifi.scanHosts(serviceUuid: serviceUuid).listen(
               ingest,
-              onError: (Object e, StackTrace st) => softError('wifi', e, st),
+              onError: ignoreTransportError,
             );
             started++;
           } catch (error) {
             lastStartError = error;
-            softError('wifi', error, StackTrace.current);
           }
         }
 
@@ -198,12 +234,11 @@ class DualBridgeManager {
           try {
             _bleScanSub = _ble.scanHosts(serviceUuid: serviceUuid).listen(
               ingest,
-              onError: (Object e, StackTrace st) => softError('ble', e, st),
+              onError: ignoreTransportError,
             );
             started++;
           } catch (error) {
             lastStartError = error;
-            softError('ble', error, StackTrace.current);
           }
         }
 
@@ -255,8 +290,11 @@ class DualBridgeManager {
     }
 
     await stopScan();
-    _setConnectionState(BridgeConnectionState.connecting);
-    _setRole(BridgeRole.client);
+    _setConnectionState(
+      BridgeConnectionState.connecting,
+      reason: 'connecting',
+    );
+    _setRole(BridgeRole.client, reason: 'connecting');
 
     try {
       final order = _transportOrder(device, preference);
@@ -274,7 +312,10 @@ class DualBridgeManager {
             await _ble.connect(ble, serviceUuid: device.serviceUuid);
             _activeTransport = TransportType.ble;
           }
-          _setConnectionState(BridgeConnectionState.connected);
+          _setConnectionState(
+            BridgeConnectionState.connected,
+            reason: 'connected',
+          );
           return;
         } catch (error) {
           lastError = error;
@@ -285,20 +326,36 @@ class DualBridgeManager {
       );
     } catch (error) {
       _activeTransport = null;
-      _setConnectionState(BridgeConnectionState.disconnected);
+      _setConnectionState(
+        BridgeConnectionState.disconnected,
+        reason: 'connect_failed',
+      );
       rethrow;
     }
   }
 
   /// Disconnect the active Client session.
   Future<void> disconnect() async {
-    _setConnectionState(BridgeConnectionState.disconnecting);
-    await _wifi.disconnect();
-    await _ble.disconnect();
+    _localDisconnect = true;
+    _setConnectionState(
+      BridgeConnectionState.disconnecting,
+      reason: 'disconnecting',
+    );
+    try {
+      await _wifi.disconnect();
+      await _ble.disconnect();
+    } finally {
+      _localDisconnect = false;
+    }
     _activeTransport = null;
-    _setConnectionState(BridgeConnectionState.disconnected);
+    _wifiPeers = 0;
+    _blePeers = 0;
+    _setConnectionState(
+      BridgeConnectionState.disconnected,
+      reason: 'disconnected',
+    );
     if (_role == BridgeRole.client) {
-      _setRole(BridgeRole.idle);
+      _setRole(BridgeRole.idle, reason: 'disconnected');
     }
   }
 
@@ -343,11 +400,61 @@ class DualBridgeManager {
     await disconnect();
     await _wifiMessageSub?.cancel();
     await _bleMessageSub?.cancel();
+    await _wifiPeerSub?.cancel();
+    await _blePeerSub?.cancel();
     await _wifi.dispose();
     await _ble.dispose();
     await _messageController.close();
     await _connectionStateController.close();
     await _roleController.close();
+    await _statusController.close();
+  }
+
+  void _onWifiPeerEvent(BridgePeerEvent event) {
+    _wifiPeers = event.peerCount;
+    _handlePeerEvent(event);
+  }
+
+  void _onBlePeerEvent(BridgePeerEvent event) {
+    _blePeers = event.peerCount;
+    _handlePeerEvent(event);
+  }
+
+  void _handlePeerEvent(BridgePeerEvent event) {
+    if (_localDisconnect) {
+      _emitStatus(
+        reason: event.type == BridgePeerEventType.connected
+            ? 'peer_connected'
+            : 'peer_disconnected',
+      );
+      return;
+    }
+
+    if (_role == BridgeRole.client &&
+        _activeTransport == event.transport &&
+        event.type == BridgePeerEventType.disconnected) {
+      _activeTransport = null;
+      _setConnectionState(
+        BridgeConnectionState.disconnected,
+        reason: 'peer_disconnected',
+      );
+      _setRole(BridgeRole.idle, reason: 'peer_disconnected');
+      return;
+    }
+
+    _emitStatus(
+      reason: event.type == BridgePeerEventType.connected
+          ? 'peer_connected'
+          : 'peer_disconnected',
+    );
+  }
+
+  int get _peerCount {
+    if (_role == BridgeRole.client &&
+        _connectionState == BridgeConnectionState.connected) {
+      return 1;
+    }
+    return _wifiPeers + _blePeers;
   }
 
   List<TransportType> _transportOrder(
@@ -372,15 +479,43 @@ class DualBridgeManager {
     }
   }
 
-  void _setRole(BridgeRole role) {
-    if (_role == role) return;
+  void _setRole(BridgeRole role, {String? reason}) {
+    if (_role == role) {
+      if (reason != null) _emitStatus(reason: reason);
+      return;
+    }
     _role = role;
-    _roleController.add(role);
+    if (!_roleController.isClosed) {
+      _roleController.add(role);
+    }
+    _emitStatus(reason: reason);
   }
 
-  void _setConnectionState(BridgeConnectionState state) {
-    if (_connectionState == state) return;
+  void _setConnectionState(
+    BridgeConnectionState state, {
+    String? reason,
+  }) {
+    if (_connectionState == state) {
+      if (reason != null) _emitStatus(reason: reason);
+      return;
+    }
     _connectionState = state;
-    _connectionStateController.add(state);
+    if (!_connectionStateController.isClosed) {
+      _connectionStateController.add(state);
+    }
+    _emitStatus(reason: reason);
+  }
+
+  void _emitStatus({String? reason}) {
+    if (_statusController.isClosed) return;
+    _statusController.add(
+      BridgeStatus(
+        role: _role,
+        connectionState: _connectionState,
+        activeTransport: _activeTransport,
+        peerCount: _peerCount,
+        reason: reason,
+      ),
+    );
   }
 }

@@ -6,6 +6,7 @@ void main() {
     await tester.pumpWidget(const NearbyDualBridgeExampleApp());
     expect(find.text('Nearby Dual Bridge'), findsOneWidget);
     expect(find.text('Start Host'), findsOneWidget);
-    expect(find.text('Scan Hosts'), findsOneWidget);
+    expect(find.text('Scan Both'), findsOneWidget);
+    expect(find.text('Scan Wi-Fi only'), findsOneWidget);
   });
 }

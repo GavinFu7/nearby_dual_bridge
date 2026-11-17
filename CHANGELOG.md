@@ -2,6 +2,7 @@
 
 * Initial release of `nearby_dual_bridge` for Android, iOS, and macOS.
 * Add `DualBridgeManager` unified Host / Client API over Wi-Fi and BLE.
+* Add `DualBridgeManager.addStatusListener` / `onStatusChanged` with peer connect/disconnect detection on Wi-Fi and BLE.
 * Wi-Fi: mDNS register/discover via `nsd`, data plane via `dart:io` WebSocket.
 * BLE: dual-role Central / Peripheral via `bluetooth_low_energy`, with chunked JSON framing.
 * Merge discovered Hosts that expose both Wi-Fi and BLE endpoints into one `BridgeDevice`.

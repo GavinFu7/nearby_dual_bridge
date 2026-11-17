@@ -6,6 +6,8 @@ import 'package:nsd/nsd.dart';
 import '../bridge_constants.dart';
 import '../interfaces/wifi_transport.dart';
 import '../models/bridge_device.dart';
+import '../models/bridge_peer_event.dart';
+import '../models/transport_type.dart';
 import '../models/wifi_endpoint.dart';
 import '../protocol/message_codec.dart';
 
@@ -23,12 +25,18 @@ class WifiTransportImpl implements WifiTransport {
   final _sockets = <WebSocket>{};
   final _messageController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final _peerController = StreamController<BridgePeerEvent>.broadcast();
   WebSocket? _clientSocket;
   String? _filterUuid;
+  bool _closingSocket = false;
 
   @override
   Stream<Map<String, dynamic>> get onMessageReceived =>
       _messageController.stream;
+
+  @override
+  Stream<BridgePeerEvent> get onPeerConnectionChanged =>
+      _peerController.stream;
 
   @override
   Future<WifiEndpoint> startHost({
@@ -100,20 +108,8 @@ class WifiTransportImpl implements WifiTransport {
           );
           _discovery = discovery;
           discovery.addServiceListener((service, status) {
-            // ignore: avoid_print
-            print(
-              '[NDB][wifi] $status name=${service.name} host=${service.host} '
-              'port=${service.port} txt=${service.txt?.keys}',
-            );
             final device = _deviceFromService(service);
-            if (device == null) {
-              // ignore: avoid_print
-              print(
-                '[NDB][wifi] skipped unresolved/filtered service '
-                'name=${service.name} host=${service.host} port=${service.port}',
-              );
-              return;
-            }
+            if (device == null) return;
             if (status == ServiceStatus.found) {
               devices[device.id] = device;
             } else {
@@ -167,16 +163,13 @@ class WifiTransportImpl implements WifiTransport {
     Object? lastError;
     for (final uri in endpoint.connectionCandidates) {
       try {
-        // ignore: avoid_print
-        print('[NDB][wifi] connecting $uri');
         final socket = await WebSocket.connect(uri.toString());
         _clientSocket = socket;
-        _attachSocket(socket);
+        _sockets.add(socket);
+        _attachSocket(socket, emitConnected: true);
         return;
       } catch (error) {
         lastError = error;
-        // ignore: avoid_print
-        print('[NDB][wifi] connect failed $uri → $error');
       }
     }
 
@@ -190,8 +183,14 @@ class WifiTransportImpl implements WifiTransport {
     final socket = _clientSocket;
     _clientSocket = null;
     if (socket != null) {
+      _closingSocket = true;
       _sockets.remove(socket);
-      await socket.close();
+      try {
+        await socket.close();
+      } finally {
+        _closingSocket = false;
+      }
+      _emitPeer(BridgePeerEventType.disconnected);
     }
   }
 
@@ -216,6 +215,7 @@ class WifiTransportImpl implements WifiTransport {
     await stopHost();
     await disconnect();
     await _messageController.close();
+    await _peerController.close();
   }
 
   Future<void> _handleHttpRequest(HttpRequest request) async {
@@ -226,10 +226,13 @@ class WifiTransportImpl implements WifiTransport {
     }
     final socket = await WebSocketTransformer.upgrade(request);
     _sockets.add(socket);
-    _attachSocket(socket);
+    _attachSocket(socket, emitConnected: true);
   }
 
-  void _attachSocket(WebSocket socket) {
+  void _attachSocket(WebSocket socket, {bool emitConnected = false}) {
+    if (emitConnected || identical(socket, _clientSocket)) {
+      _emitPeer(BridgePeerEventType.connected);
+    }
     socket.listen(
       (event) {
         try {
@@ -242,9 +245,32 @@ class WifiTransportImpl implements WifiTransport {
           // Ignore malformed frames.
         }
       },
-      onDone: () => _sockets.remove(socket),
-      onError: (_) => _sockets.remove(socket),
+      onDone: () => _handleSocketClosed(socket),
+      onError: (_) => _handleSocketClosed(socket),
       cancelOnError: true,
+    );
+  }
+
+  void _handleSocketClosed(WebSocket socket) {
+    final removed = _sockets.remove(socket);
+    if (identical(_clientSocket, socket)) {
+      _clientSocket = null;
+    }
+    if (removed && !_closingSocket) {
+      _emitPeer(BridgePeerEventType.disconnected);
+    }
+  }
+
+  int get _peerCount => _sockets.length;
+
+  void _emitPeer(BridgePeerEventType type) {
+    if (_peerController.isClosed) return;
+    _peerController.add(
+      BridgePeerEvent(
+        transport: TransportType.wifi,
+        type: type,
+        peerCount: _peerCount,
+      ),
     );
   }
 
