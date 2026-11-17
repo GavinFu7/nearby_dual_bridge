@@ -1,17 +1,22 @@
-# nearby_dual_bridge_example
+# nearby_dual_bridge example
 
-Demonstrates how to use the nearby_dual_bridge plugin.
+Demonstrates Host / Client dual-role nearby communication over **Wi-Fi** (mDNS + WebSocket) and **BLE**.
 
-## Getting Started
+## Run
 
-This project is a starting point for a Flutter application.
+```bash
+cd example
+flutter run -d <device>
+```
 
-A few resources to get you started if this is your first Flutter project:
+Use two physical devices (or one macOS + one phone) on the same Wi-Fi for discovery.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+1. Device A: set a name → **Start Host**
+2. Device B: same Service UUID → **Scan Hosts** → **Connect**
+3. Send chat messages either way
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Platform notes
+
+- Android / iOS / macOS permissions are already wired in this example.
+- BLE does not work on emulators; use real hardware.
+- Keep Service UUID identical on both sides (default is filled in).

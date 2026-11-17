@@ -1,28 +1,39 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nearby_dual_bridge/nearby_dual_bridge.dart';
-import 'package:nearby_dual_bridge/nearby_dual_bridge_platform_interface.dart';
-import 'package:nearby_dual_bridge/nearby_dual_bridge_method_channel.dart';
-import 'package:plugin_platform_interface/plugin_platform_interface.dart';
-
-class MockNearbyDualBridgePlatform
-    with MockPlatformInterfaceMixin
-    implements NearbyDualBridgePlatform {
-  @override
-  Future<String?> getPlatformVersion() => Future.value('42');
-}
 
 void main() {
-  final NearbyDualBridgePlatform initialPlatform = NearbyDualBridgePlatform.instance;
-
-  test('$MethodChannelNearbyDualBridge is the default instance', () {
-    expect(initialPlatform, isInstanceOf<MethodChannelNearbyDualBridge>());
+  test('DualBridgeManager starts idle and disconnected', () {
+    final bridge = DualBridgeManager();
+    expect(bridge.role, BridgeRole.idle);
+    expect(bridge.connectionState, BridgeConnectionState.disconnected);
+    expect(bridge.activeTransport, isNull);
   });
 
-  test('getPlatformVersion', () async {
-    NearbyDualBridge nearbyDualBridgePlugin = NearbyDualBridge();
-    MockNearbyDualBridgePlatform fakePlatform = MockNearbyDualBridgePlatform();
-    NearbyDualBridgePlatform.instance = fakePlatform;
+  test('BridgeDevice merges wifi and ble endpoints', () {
+    final wifiOnly = BridgeDevice(
+      id: 'dev-1',
+      name: 'TV',
+      serviceUuid: 'uuid',
+      wifi: const WifiEndpoint(host: 'tv.local', port: 8787),
+    );
+    final bleOnly = BridgeDevice(
+      id: 'dev-1',
+      name: 'TV',
+      serviceUuid: 'uuid',
+      ble: const BleEndpoint(peripheralId: 'AA:BB', rssi: -50),
+    );
 
-    expect(await nearbyDualBridgePlugin.getPlatformVersion(), '42');
+    final merged = wifiOnly.merge(bleOnly);
+    expect(merged.supportsWifi, isTrue);
+    expect(merged.supportsBle, isTrue);
+    expect(merged.isDualTransport, isTrue);
+    expect(merged.ble?.rssi, -50);
+  });
+
+  test('BridgeConstants builds stable device ids', () {
+    expect(
+      BridgeConstants.deviceId(serviceUuid: 'ABC', name: ' Living-Room '),
+      'abc|living-room',
+    );
   });
 }

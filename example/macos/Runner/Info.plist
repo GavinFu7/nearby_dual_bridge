@@ -28,5 +28,13 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Used to discover and connect to nearby Dual Bridge hosts over Bluetooth.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Used to discover and connect to nearby Dual Bridge hosts on the local Wi-Fi network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ndb._tcp</string>
+	</array>
 </dict>
 </plist>
