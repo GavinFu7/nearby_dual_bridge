@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -32,21 +34,34 @@ class BleTransportImpl implements BleTransport {
   final _hostReassembler = BleChunkReassembler();
   final _clientReassembler = BleChunkReassembler();
 
+  static const _bleStaleTimeout = Duration(seconds: 6);
+  static const _bleStaleCheckInterval = Duration(seconds: 1);
+
   StreamController<List<BridgeDevice>>? _scanController;
   StreamSubscription? _discoveredSub;
   StreamSubscription? _writeSub;
   StreamSubscription? _notifyStateSub;
   StreamSubscription? _centralNotifiedSub;
   StreamSubscription? _centralConnectionSub;
+  Timer? _scanStaleTimer;
 
   GATTCharacteristic? _hostCharacteristic;
   final _subscribedCentrals = <Central>{};
   Peripheral? _connectedPeripheral;
   GATTCharacteristic? _clientCharacteristic;
   String? _filterUuid;
+  String? _hostDeviceName;
   bool _hosting = false;
   bool _scanning = false;
   bool _closingLink = false;
+  bool _resolvingNames = false;
+  bool _nameResolveRunning = false;
+
+  final _lastPeripheralById = <String, Peripheral>{};
+  final _lastAdvertisementAt = <String, DateTime>{};
+  final _nameResolveQueue = Queue<String>();
+  final _nameResolveQueuedOrDone = <String>{};
+  final _resolvedNames = <String, String>{};
 
   @override
   Stream<Map<String, dynamic>> get onMessageReceived =>
@@ -64,10 +79,13 @@ class BleTransportImpl implements BleTransport {
     await stopHost();
     await _ensureReady(_peripheral);
 
+    _hostDeviceName = deviceName.trim().isEmpty ? 'NDB' : deviceName.trim();
     final serviceUuidObj = UUID.fromString(serviceUuid);
     final charUuid = UUID.fromString(BridgeConstants.messageCharacteristicUuid);
+    final nameCharUuid =
+        UUID.fromString(BridgeConstants.deviceNameCharacteristicUuid);
 
-    final characteristic = GATTCharacteristic.mutable(
+    final messageCharacteristic = GATTCharacteristic.mutable(
       uuid: charUuid,
       properties: const [
         GATTCharacteristicProperty.write,
@@ -80,13 +98,19 @@ class BleTransportImpl implements BleTransport {
       ],
       descriptors: const [],
     );
-    _hostCharacteristic = characteristic;
+    _hostCharacteristic = messageCharacteristic;
+
+    final nameCharacteristic = GATTCharacteristic.immutable(
+      uuid: nameCharUuid,
+      value: Uint8List.fromList(utf8.encode(_hostDeviceName!)),
+      descriptors: const [],
+    );
 
     final service = GATTService(
       uuid: serviceUuidObj,
       isPrimary: true,
       includedServices: const [],
-      characteristics: [characteristic],
+      characteristics: [nameCharacteristic, messageCharacteristic],
     );
 
     await _peripheral.removeAllServices();
@@ -128,9 +152,9 @@ class BleTransportImpl implements BleTransport {
       }
     });
 
-    // Apple drops Local Name when it doesn't fit beside a 128-bit service UUID
-    // (often ~8 bytes on modern macOS). Keep a short advertise name.
-    final advertiseName = _bleAdvertiseName(deviceName);
+    // Apple Local Name beside a 128-bit service UUID is ~8 bytes. Advertise only
+    // the correlation code; full `code + displayName` is on the name characteristic.
+    final advertiseName = _bleAdvertiseName(_hostDeviceName!);
     await _peripheral.startAdvertising(
       Advertisement(
         name: Platform.isWindows ? null : advertiseName,
@@ -142,16 +166,33 @@ class BleTransportImpl implements BleTransport {
 
   @override
   Future<void> stopHost() async {
-    if (_hosting) {
-      await _peripheral.stopAdvertising();
-      await _peripheral.removeAllServices();
-      _hosting = false;
+    // Always attempt teardown even if `_hosting` drifted — scanners should stop
+    // seeing this peripheral promptly after Stop Host.
+    if (_peripheralManagerInstance != null) {
+      try {
+        await _peripheral.stopAdvertising();
+      } catch (_) {}
+      if (Platform.isAndroid) {
+        try {
+          final centrals = await _peripheral.retrieveConnectedCentrals();
+          for (final central in centrals) {
+            try {
+              await _peripheral.disconnect(central);
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }
+      try {
+        await _peripheral.removeAllServices();
+      } catch (_) {}
     }
+    _hosting = false;
     await _writeSub?.cancel();
     await _notifyStateSub?.cancel();
     _writeSub = null;
     _notifyStateSub = null;
     _hostCharacteristic = null;
+    _hostDeviceName = null;
     _subscribedCentrals.clear();
     _hostReassembler.reset();
   }
@@ -164,6 +205,8 @@ class BleTransportImpl implements BleTransport {
     controller = StreamController<List<BridgeDevice>>(
       onListen: () async {
         await _stopDiscoveryEngine();
+        _resetNameResolveState();
+        _resolvingNames = true;
         try {
           await _ensureReady(_central);
         } catch (error, stackTrace) {
@@ -178,35 +221,84 @@ class BleTransportImpl implements BleTransport {
           final peripheralKey =
               event.peripheral.uuid.toString().toLowerCase();
           _lastPeripheralById[peripheralKey] = event.peripheral;
+          _lastAdvertisementAt[peripheralKey] = DateTime.now();
 
-          // iOS/macOS often omit Local Name when advertising a 128-bit UUID.
-          // Still surface the peripheral so discovery is not silently dropped.
           final advertisedName = advertisement.name?.trim();
-          final name = (advertisedName != null && advertisedName.isNotEmpty)
-              ? advertisedName
-              : 'BLE-${peripheralKey.replaceAll('-', '').substring(0, 6)}';
+          final previous = devices[peripheralKey];
+          final fromAdvertise = advertisedName == null
+              ? null
+              : BridgeConstants.parseDeviceName(advertisedName);
 
-          final id = BridgeConstants.deviceId(
-            serviceUuid: serviceUuid,
-            name: name,
-          );
-          devices[id] = BridgeDevice(
+          // Host restart changes the correlation code on the same peripheral.
+          final cachedWire = _resolvedNames[peripheralKey];
+          if (fromAdvertise != null && cachedWire != null) {
+            final cached = BridgeConstants.parseDeviceName(cachedWire);
+            if (cached != null && cached.code != fromAdvertise.code) {
+              _resolvedNames.remove(peripheralKey);
+              _nameResolveQueuedOrDone.remove(peripheralKey);
+            }
+          }
+
+          final resolvedWire = _resolvedNames[peripheralKey];
+          final fromResolved = resolvedWire == null
+              ? null
+              : BridgeConstants.parseDeviceName(resolvedWire);
+
+          final correlationCode =
+              fromAdvertise?.code ??
+              fromResolved?.code ??
+              previous?.correlationCode;
+          final resolvedDisplay = fromResolved?.displayName.trim() ?? '';
+          final nameResolved = resolvedDisplay.isNotEmpty;
+          final displayName = nameResolved
+              ? resolvedDisplay
+              : (previous?.nameResolved == true ? previous!.name : '');
+
+          final id = correlationCode != null
+              ? BridgeConstants.deviceId(
+                  serviceUuid: serviceUuid,
+                  correlationCode: correlationCode,
+                )
+              : BridgeConstants.bleDeviceId(
+                  serviceUuid: serviceUuid,
+                  peripheralId: peripheralKey,
+                );
+
+          devices[peripheralKey] = BridgeDevice(
             id: id,
-            name: name,
+            name: displayName,
             serviceUuid: serviceUuid,
+            correlationCode: correlationCode,
+            nameResolved: nameResolved || (previous?.nameResolved ?? false),
             ble: BleEndpoint(
               peripheralId: peripheralKey,
               rssi: event.rssi,
-              advertisedName: advertisedName,
+              advertisedName: advertisedName ?? previous?.ble?.advertisedName,
             ),
             lastSeen: DateTime.now(),
           );
-          if (!controller.isClosed) {
-            controller.add(devices.values.toList(growable: false));
+          _emitScanSnapshot(controller, devices);
+
+          if (_resolvingNames &&
+              _scanning &&
+              !_nameResolveQueuedOrDone.contains(peripheralKey)) {
+            _nameResolveQueuedOrDone.add(peripheralKey);
+            _nameResolveQueue.add(peripheralKey);
+            unawaited(
+              _pumpNameResolveQueue(
+                serviceUuid: serviceUuid,
+                devices: devices,
+                controller: controller,
+              ),
+            );
           }
         });
         await _central.startDiscovery(serviceUUIDs: [uuid]);
         _scanning = true;
+        _scanStaleTimer?.cancel();
+        _scanStaleTimer = Timer.periodic(_bleStaleCheckInterval, (_) {
+          _pruneStaleScanDevices(devices, controller);
+        });
       },
       onCancel: _stopDiscoveryEngine,
     );
@@ -220,12 +312,50 @@ class BleTransportImpl implements BleTransport {
   }
 
   Future<void> _stopDiscoveryEngine() async {
+    _resolvingNames = false;
+    _nameResolveQueue.clear();
+    _scanStaleTimer?.cancel();
+    _scanStaleTimer = null;
     if (_scanning) {
       await _central.stopDiscovery();
       _scanning = false;
     }
     await _discoveredSub?.cancel();
     _discoveredSub = null;
+    // Wait for in-flight name resolve to finish disconnecting.
+    while (_nameResolveRunning) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+
+  /// Drop BLE sightings that stopped advertising (e.g. after remote Stop Host).
+  void _pruneStaleScanDevices(
+    Map<String, BridgeDevice> devices,
+    StreamController<List<BridgeDevice>> controller,
+  ) {
+    // Name resolve pauses discovery briefly; don't treat that gap as "gone".
+    if (controller.isClosed ||
+        devices.isEmpty ||
+        !_scanning ||
+        _nameResolveRunning) {
+      return;
+    }
+    final now = DateTime.now();
+    final staleKeys = <String>[];
+    for (final key in devices.keys) {
+      final last = _lastAdvertisementAt[key];
+      if (last == null || now.difference(last) > _bleStaleTimeout) {
+        staleKeys.add(key);
+      }
+    }
+    if (staleKeys.isEmpty) return;
+    for (final key in staleKeys) {
+      devices.remove(key);
+      _lastAdvertisementAt.remove(key);
+      // Allow a later reappearance (new Host session) to resolve again.
+      _nameResolveQueuedOrDone.remove(key);
+    }
+    _emitScanSnapshot(controller, devices);
   }
 
   @override
@@ -238,11 +368,145 @@ class BleTransportImpl implements BleTransport {
     }
   }
 
+  void _resetNameResolveState() {
+    _nameResolveQueue.clear();
+    _nameResolveQueuedOrDone.clear();
+    // Keep _resolvedNames across stop/start within process so rediscovery is faster.
+  }
+
+  void _emitScanSnapshot(
+    StreamController<List<BridgeDevice>> controller,
+    Map<String, BridgeDevice> devices,
+  ) {
+    if (controller.isClosed) return;
+    controller.add(devices.values.toList(growable: false));
+  }
+
+  Future<void> _pumpNameResolveQueue({
+    required String serviceUuid,
+    required Map<String, BridgeDevice> devices,
+    required StreamController<List<BridgeDevice>> controller,
+  }) async {
+    if (_nameResolveRunning) return;
+    _nameResolveRunning = true;
+    try {
+      while (_resolvingNames && _nameResolveQueue.isNotEmpty) {
+        final peripheralKey = _nameResolveQueue.removeFirst();
+        try {
+          final fullName = await _resolvePeripheralName(peripheralKey);
+          if (!_resolvingNames) break;
+          if (fullName == null || fullName.isEmpty) continue;
+
+          _resolvedNames[peripheralKey] = fullName;
+          final existing = devices[peripheralKey];
+          if (existing == null) continue;
+
+          final parsed = BridgeConstants.parseDeviceName(fullName);
+          final correlationCode = parsed?.code ?? existing.correlationCode;
+          final displayName = parsed == null
+              ? fullName.trim()
+              : parsed.displayName.trim();
+          if (displayName.isEmpty) continue;
+
+          final id = correlationCode != null
+              ? BridgeConstants.deviceId(
+                  serviceUuid: serviceUuid,
+                  correlationCode: correlationCode,
+                )
+              : existing.id;
+
+          devices[peripheralKey] = existing.copyWith(
+            id: id,
+            name: displayName,
+            correlationCode: correlationCode,
+            nameResolved: true,
+            lastSeen: DateTime.now(),
+          );
+          _emitScanSnapshot(controller, devices);
+        } catch (_) {
+          // Keep scanning; name resolve is best-effort.
+        }
+      }
+    } finally {
+      _nameResolveRunning = false;
+      if (_resolvingNames && _scanning == false) {
+        // Resolver paused discovery to connect; resume if still resolving.
+      }
+    }
+  }
+
+  /// Connect briefly, read full device name, disconnect. Does not emit peer events.
+  Future<String?> _resolvePeripheralName(String peripheralKey) async {
+    final peripheral = _lastPeripheralById[peripheralKey];
+    if (peripheral == null) return null;
+
+    // iOS/macOS generally require stopping scan before connecting.
+    final wasScanning = _scanning;
+    if (wasScanning) {
+      await _central.stopDiscovery();
+      _scanning = false;
+    }
+
+    try {
+      await _central.connect(peripheral);
+      try {
+        final services = await _central.discoverGATT(peripheral);
+        final nameCharUuid =
+            UUID.fromString(BridgeConstants.deviceNameCharacteristicUuid);
+        final gapNameUuid = UUID.short(0x2A00);
+
+        for (final service in services) {
+          for (final characteristic in service.characteristics) {
+            if (characteristic.uuid != nameCharUuid &&
+                characteristic.uuid != gapNameUuid) {
+              continue;
+            }
+            if (!characteristic.properties
+                .contains(GATTCharacteristicProperty.read)) {
+              continue;
+            }
+            final bytes = await _central.readCharacteristic(
+              peripheral,
+              characteristic,
+            );
+            final name = utf8.decode(bytes).trim();
+            if (name.isNotEmpty) {
+              return name;
+            }
+          }
+        }
+      } finally {
+        try {
+          await _central.disconnect(peripheral);
+        } catch (_) {}
+      }
+    } finally {
+      if (_resolvingNames &&
+          wasScanning &&
+          _scanController != null &&
+          !_scanController!.isClosed) {
+        final uuid = UUID.fromString(
+          _filterUuid ?? BridgeConstants.defaultServiceUuid,
+        );
+        await _central.startDiscovery(serviceUUIDs: [uuid]);
+        _scanning = true;
+      }
+    }
+    return null;
+  }
+
   @override
   Future<void> connect(
     BleEndpoint endpoint, {
     String? serviceUuid,
   }) async {
+    // Formal session connect must not race with name resolve.
+    _resolvingNames = false;
+    _nameResolveQueue.clear();
+    while (_nameResolveRunning) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+
     await disconnect();
     await _ensureReady(_central);
 
@@ -256,6 +520,11 @@ class BleTransportImpl implements BleTransport {
         'BLE peripheral ${endpoint.peripheralId} is not in the discovery cache. '
         'Scan again before connecting.',
       );
+    }
+
+    if (_scanning) {
+      await _central.stopDiscovery();
+      _scanning = false;
     }
 
     await _centralConnectionSub?.cancel();
@@ -298,9 +567,7 @@ class BleTransportImpl implements BleTransport {
     );
 
     await _centralNotifiedSub?.cancel();
-    _centralNotifiedSub = _central.characteristicNotified.listen((
-      event,
-    ) {
+    _centralNotifiedSub = _central.characteristicNotified.listen((event) {
       if (event.peripheral != resolved) return;
       if (event.characteristic.uuid != charUuid) return;
       try {
@@ -315,8 +582,6 @@ class BleTransportImpl implements BleTransport {
       }
     });
   }
-
-  final _lastPeripheralById = <String, Peripheral>{};
 
   @override
   Future<void> disconnect() async {
@@ -351,7 +616,6 @@ class BleTransportImpl implements BleTransport {
           final maxLen =
               await _peripheral.getMaximumNotifyLength(central);
           if (frame.length > maxLen) {
-            // Re-chunk with tighter payload if MTU is smaller than assumed.
             final tight = BleChunkProtocol(maxPayloadPerChunk: maxLen - 5)
                 .encode(data);
             for (final part in tight) {
@@ -480,11 +744,15 @@ class BleTransportImpl implements BleTransport {
 
   String _normalizeUuid(String value) => value.trim().toLowerCase();
 
-  /// Shorten names for Apple BLE advertise payload limits.
-  String _bleAdvertiseName(String deviceName) {
-    final trimmed = deviceName.trim();
+  /// Advertise Local Name = correlation code only (Apple ~8-byte limit).
+  String _bleAdvertiseName(String wireDeviceName) {
+    final parsed = BridgeConstants.parseDeviceName(wireDeviceName);
+    if (parsed != null) return parsed.code;
+    final trimmed = wireDeviceName.trim();
     if (trimmed.isEmpty) return 'NDB';
-    if (trimmed.length <= 8) return trimmed;
-    return trimmed.substring(0, 8);
+    if (trimmed.length <= BridgeConstants.correlationCodeLength) {
+      return trimmed;
+    }
+    return trimmed.substring(0, BridgeConstants.correlationCodeLength);
   }
 }

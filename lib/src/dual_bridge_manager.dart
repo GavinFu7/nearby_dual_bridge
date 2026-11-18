@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'ble/ble_transport_impl.dart';
+import 'bridge_constants.dart';
 import 'interfaces/ble_transport.dart';
 import 'interfaces/bridge_permissions.dart';
 import 'interfaces/wifi_transport.dart';
@@ -13,6 +14,7 @@ import 'models/connection_preference.dart';
 import 'models/host_session.dart';
 import 'models/transport_type.dart';
 import 'permissions/bridge_permissions_impl.dart';
+import 'scan_merge.dart';
 import 'wifi/wifi_transport_impl.dart';
 
 /// Unified Host/Client API over Wi-Fi (mDNS + WebSocket) and BLE.
@@ -97,6 +99,10 @@ class DualBridgeManager {
 
   /// Start Host mode: local WebSocket server + mDNS + BLE Peripheral advertising.
   ///
+  /// [deviceName] is the display name. An 8-char correlation code is prepended
+  /// automatically for Wi-Fi + BLE; Clients strip it before showing the name and
+  /// use it to merge dual-transport sightings of the same Host.
+  ///
   /// Wi-Fi Host is required. BLE advertise failures are reported in
   /// [HostSession.bleError] without tearing down Wi-Fi, so you can still test
   /// mDNS / WebSocket while debugging Bluetooth.
@@ -115,8 +121,13 @@ class DualBridgeManager {
       throw StateError('Host permissions were not granted');
     }
 
+    final wireName = BridgeConstants.encodeDeviceName(
+      correlationCode: BridgeConstants.generateCorrelationCode(),
+      displayName: deviceName,
+    );
+
     final wifi = await _wifi.startHost(
-      deviceName: deviceName,
+      deviceName: wireName,
       serviceUuid: serviceUuid,
     );
 
@@ -124,7 +135,7 @@ class DualBridgeManager {
     var bleAdvertising = false;
     try {
       await _ble.startHost(
-        deviceName: deviceName,
+        deviceName: wireName,
         serviceUuid: serviceUuid,
       );
       bleAdvertising = true;
@@ -143,9 +154,19 @@ class DualBridgeManager {
   /// Stop Host mode and tear down all advertisements / servers.
   Future<void> stopHost() async {
     _localDisconnect = true;
+    Object? bleError;
+    Object? wifiError;
     try {
-      await _ble.stopHost();
-      await _wifi.stopHost();
+      try {
+        await _ble.stopHost();
+      } catch (error) {
+        bleError = error;
+      }
+      try {
+        await _wifi.stopHost();
+      } catch (error) {
+        wifiError = error;
+      }
     } finally {
       _localDisconnect = false;
     }
@@ -155,6 +176,9 @@ class DualBridgeManager {
       _setRole(BridgeRole.idle, reason: 'host_stopped');
     }
     _emitStatus(reason: 'host_stopped');
+    if (bleError != null && wifiError != null) {
+      throw StateError('stopHost failed (ble: $bleError, wifi: $wifiError)');
+    }
   }
 
   /// Scan for Hosts via mDNS and/or BLE Central, filtered by [serviceUuid].
@@ -174,22 +198,29 @@ class DualBridgeManager {
       );
     }
 
-    final merged = <String, BridgeDevice>{};
+    // Keep per-transport snapshots so continuous scan updates replace stale
+    // rows (e.g. BLE name resolve) instead of accumulating old ids.
+    var wifiDevices = <BridgeDevice>[];
+    var bleDevices = <BridgeDevice>[];
+    final seenWithWifiKeys = <String>{};
+    final suppressBleOnlyKeys = <String>{};
     late final StreamController<List<BridgeDevice>> controller;
 
-    void emit() {
-      if (!controller.isClosed) {
-        controller.add(merged.values.toList(growable: false));
-      }
-    }
-
-    void ingest(List<BridgeDevice> batch) {
-      for (final device in batch) {
-        final existing = merged[device.id];
-        merged[device.id] =
-            existing == null ? device : existing.merge(device);
-      }
-      emit();
+    void emitMerged() {
+      if (controller.isClosed) return;
+      updateWifiLossBleSuppression(
+        seenWithWifiKeys: seenWithWifiKeys,
+        suppressBleOnlyKeys: suppressBleOnlyKeys,
+        wifiKeys: wifiDevices.map(scanMergeKey),
+        bleKeys: bleDevices.map(scanMergeKey),
+      );
+      controller.add(
+        mergeWifiBleScanSnapshots(
+          wifiDevices: wifiDevices,
+          bleDevices: bleDevices,
+          suppressBleOnlyKeys: suppressBleOnlyKeys,
+        ),
+      );
     }
 
     // Per-transport scan errors are swallowed so the other transport can
@@ -199,6 +230,10 @@ class DualBridgeManager {
     controller = StreamController<List<BridgeDevice>>(
       onListen: () async {
         await _stopTransportScans();
+        wifiDevices = [];
+        bleDevices = [];
+        seenWithWifiKeys.clear();
+        suppressBleOnlyKeys.clear();
 
         final granted = await _permissions.ensureScanPermissions();
         if (!granted) {
@@ -221,7 +256,10 @@ class DualBridgeManager {
         if (wifi) {
           try {
             _wifiScanSub = _wifi.scanHosts(serviceUuid: serviceUuid).listen(
-              ingest,
+              (batch) {
+                wifiDevices = batch;
+                emitMerged();
+              },
               onError: ignoreTransportError,
             );
             started++;
@@ -233,7 +271,10 @@ class DualBridgeManager {
         if (ble) {
           try {
             _bleScanSub = _ble.scanHosts(serviceUuid: serviceUuid).listen(
-              ingest,
+              (batch) {
+                bleDevices = batch;
+                emitMerged();
+              },
               onError: ignoreTransportError,
             );
             started++;

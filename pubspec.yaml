@@ -1,6 +1,6 @@
 name: nearby_dual_bridge
 description: "A cross-platform, dual-role proximity bridge. It can dynamically act as a host or client via Wi-Fi (mDNS + WebSocket) and connect via BLE (center/peripheral)."
-version: 0.0.1
+version: 0.0.2
 homepage: https://github.com/GavinFu7
 repository: https://github.com/GavinFu7/nearby_dual_bridge
 
@@ -14,7 +14,6 @@ dependencies:
   bluetooth_low_energy: ^6.2.1
   nsd: ^5.0.1
   permission_handler: ^13.0.2
-  plugin_platform_interface: ^2.0.2
 
 dev_dependencies:
   flutter_test:
@@ -22,12 +21,3 @@ dev_dependencies:
   flutter_lints: ^6.0.0
 
 flutter:
-  plugin:
-    platforms:
-      android:
-        package: com.example.nearby_dual_bridge
-        pluginClass: NearbyDualBridgePlugin
-      ios:
-        pluginClass: NearbyDualBridgePlugin
-      macos:
-        pluginClass: NearbyDualBridgePlugin

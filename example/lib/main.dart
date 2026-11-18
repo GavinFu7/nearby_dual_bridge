@@ -37,7 +37,7 @@ class BridgeHomePage extends StatefulWidget {
 
 class _BridgeHomePageState extends State<BridgeHomePage> {
   final _bridge = DualBridgeManager();
-  // Keep <= 8 chars so macOS BLE Local Name is more likely to be advertised.
+  // Display name only; package prepends a hidden 8-char correlation code.
   final _deviceNameController = TextEditingController(text: 'MacHost');
   final _serviceUuidController = TextEditingController(
     text: BridgeConstants.defaultServiceUuid,
@@ -55,6 +55,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   bool _scanning = false;
   bool _busy = false;
   List<BridgeDevice> _devices = const [];
+  BridgeDevice? _connectedDevice;
   StreamSubscription? _scanSub;
   StreamSubscription? _messageSub;
   StreamSubscription? _statusSub;
@@ -73,6 +74,10 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
           _hosting = true;
         } else if (status.reason == 'host_stopped') {
           _hosting = false;
+        }
+        if (status.connectionState == BridgeConnectionState.disconnected ||
+            status.connectionState == BridgeConnectionState.disconnecting) {
+          _connectedDevice = null;
         }
       });
       final reason = status.reason;
@@ -171,7 +176,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
           'mDNS ${BridgeConstants.mdnsServiceType}',
         );
         if (session.bleAdvertising) {
-          _appendLog('BLE advertising OK (name may be truncated to 8 chars)');
+          _appendLog('BLE advertising OK (Local Name = 8-char correlation code)');
         } else {
           _appendLog('BLE advertising FAILED: ${session.bleError}');
           _appendLog('Wi-Fi Host is still running — you can test mDNS first');
@@ -242,10 +247,21 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
         FocusScope.of(context).unfocus();
         await _stopScan();
         await _bridge.connect(device, preference: _preference);
+        if (!mounted) return;
+        setState(() {
+          _connectedDevice = device;
+          // Keep the connected Host visible after scan stops.
+          if (!_devices.any((d) => d.id == device.id)) {
+            _devices = [..._devices, device];
+          }
+        });
         _appendLog(
           'Connected to ${device.name} via ${_bridge.activeTransport?.name}',
         );
       } catch (error) {
+        if (mounted) {
+          setState(() => _connectedDevice = null);
+        }
         _appendLog('Connect error: $error');
       }
     });
@@ -255,11 +271,19 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     await _runBusy(() async {
       try {
         await _bridge.disconnect();
+        if (mounted) {
+          setState(() => _connectedDevice = null);
+        }
         _appendLog('Disconnected');
       } catch (error) {
         _appendLog('Disconnect error: $error');
       }
     });
+  }
+
+  bool _isConnectedTo(BridgeDevice device) {
+    return _connectionState == BridgeConnectionState.connected &&
+        _connectedDevice?.id == device.id;
   }
 
   Future<void> _send() async {
@@ -398,12 +422,6 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                       icon: const Icon(Icons.bluetooth_searching),
                       label: const Text('Scan BLE only'),
                     ),
-                    if (_connectionState == BridgeConnectionState.connected)
-                      OutlinedButton.icon(
-                        onPressed: _busy ? null : _disconnect,
-                        icon: const Icon(Icons.link_off),
-                        label: const Text('Disconnect'),
-                      ),
                   ],
                 ),
                 if (_scanning) ...[
@@ -478,11 +496,25 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                             const SizedBox(height: 12),
                             Align(
                               alignment: Alignment.centerRight,
-                              child: FilledButton(
-                                onPressed:
-                                    _busy ? null : () => _connect(device),
-                                child: const Text('Connect'),
-                              ),
+                              child: _isConnectedTo(device)
+                                  ? FilledButton.tonalIcon(
+                                      onPressed:
+                                          _busy ? null : _disconnect,
+                                      icon: const Icon(Icons.link_off),
+                                      label: const Text('Disconnect'),
+                                    )
+                                  : FilledButton(
+                                      onPressed: (_busy ||
+                                              _connectionState ==
+                                                  BridgeConnectionState
+                                                      .connected ||
+                                              _connectionState ==
+                                                  BridgeConnectionState
+                                                      .connecting)
+                                          ? null
+                                          : () => _connect(device),
+                                      child: const Text('Connect'),
+                                    ),
                             ),
                           ],
                         ),

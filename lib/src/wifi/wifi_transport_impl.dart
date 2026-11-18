@@ -275,8 +275,8 @@ class WifiTransportImpl implements WifiTransport {
   }
 
   BridgeDevice? _deviceFromService(Service service) {
-    final name = service.name;
-    if (name == null || name.isEmpty) return null;
+    final wireName = service.name;
+    if (wireName == null || wireName.isEmpty) return null;
 
     final txtUuid = BridgeConstants.txtString(
       service.txt,
@@ -302,15 +302,28 @@ class WifiTransportImpl implements WifiTransport {
         service.addresses?.map((a) => a.address).toList(growable: false) ??
             const <String>[];
 
+    final parsed = BridgeConstants.parseDeviceName(wireName);
+    final correlationCode = parsed?.code;
+    final displayName = parsed == null
+        ? wireName
+        : (parsed.displayName.trim().isEmpty
+            ? wireName
+            : parsed.displayName.trim());
+
     return BridgeDevice(
-      id: BridgeConstants.deviceId(serviceUuid: serviceUuid, name: name),
-      name: name,
+      id: BridgeConstants.deviceId(
+        serviceUuid: serviceUuid,
+        correlationCode: correlationCode ?? wireName,
+      ),
+      name: displayName,
       serviceUuid: serviceUuid,
+      correlationCode: correlationCode,
+      nameResolved: true,
       wifi: WifiEndpoint(
         host: host,
         port: port,
         addresses: addresses,
-        serviceName: name,
+        serviceName: wireName,
       ),
       lastSeen: DateTime.now(),
     );

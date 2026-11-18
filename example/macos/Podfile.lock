@@ -3,15 +3,12 @@ PODS:
     - Flutter
     - FlutterMacOS
   - FlutterMacOS (1.0.0)
-  - nearby_dual_bridge (0.0.1):
-    - FlutterMacOS
   - nsd_macos (0.0.1):
     - FlutterMacOS
 
 DEPENDENCIES:
   - bluetooth_low_energy_darwin (from `Flutter/ephemeral/.symlinks/plugins/bluetooth_low_energy_darwin/darwin`)
   - FlutterMacOS (from `Flutter/ephemeral`)
-  - nearby_dual_bridge (from `Flutter/ephemeral/.symlinks/plugins/nearby_dual_bridge/macos`)
   - nsd_macos (from `Flutter/ephemeral/.symlinks/plugins/nsd_macos/macos`)
 
 EXTERNAL SOURCES:
@@ -19,15 +16,12 @@ EXTERNAL SOURCES:
     :path: Flutter/ephemeral/.symlinks/plugins/bluetooth_low_energy_darwin/darwin
   FlutterMacOS:
     :path: Flutter/ephemeral
-  nearby_dual_bridge:
-    :path: Flutter/ephemeral/.symlinks/plugins/nearby_dual_bridge/macos
   nsd_macos:
     :path: Flutter/ephemeral/.symlinks/plugins/nsd_macos/macos
 
 SPEC CHECKSUMS:
   bluetooth_low_energy_darwin: 8027d98a11f64f880e4c738157dfe5ca88d28dbc
   FlutterMacOS: c232990155153907050900a2e175c7773903ba4e
-  nearby_dual_bridge: dade1423ea5ed133bc71154de35710ac3a812aec
   nsd_macos: 2bf2a077506c4aa72e448c0ee754e102624ade80
 
 PODFILE CHECKSUM: 6682abfda747901c6c8e17abec374db3fa422a4f
