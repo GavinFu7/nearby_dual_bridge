@@ -10,8 +10,6 @@ import 'dart:typed_data';
 /// - `flags` bit0 = last chunk (`0x01`)
 /// - `seq` / `total` are big-endian uint16
 /// - payload is UTF-8 bytes of the JSON (split across chunks)
-///
-/// Full send/receive helpers will be wired into [BleTransport] later.
 class BleChunkProtocol {
   BleChunkProtocol({this.maxPayloadPerChunk = 180});
 

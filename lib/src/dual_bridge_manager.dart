@@ -258,6 +258,14 @@ class DualBridgeManager {
             _wifiScanSub = _wifi.scanHosts(serviceUuid: serviceUuid).listen(
               (batch) {
                 wifiDevices = batch;
+                if (ble) {
+                  _ble.updateWifiMatchedCorrelationCodes({
+                    for (final device in batch)
+                      if (device.correlationCode != null &&
+                          device.correlationCode!.trim().isNotEmpty)
+                        device.correlationCode!.trim().toLowerCase(),
+                  });
+                }
                 emitMerged();
               },
               onError: ignoreTransportError,
@@ -270,6 +278,9 @@ class DualBridgeManager {
 
         if (ble) {
           try {
+            if (!wifi) {
+              _ble.updateWifiMatchedCorrelationCodes(const {});
+            }
             _bleScanSub = _ble.scanHosts(serviceUuid: serviceUuid).listen(
               (batch) {
                 bleDevices = batch;
@@ -308,6 +319,7 @@ class DualBridgeManager {
     await _bleScanSub?.cancel();
     _wifiScanSub = null;
     _bleScanSub = null;
+    _ble.updateWifiMatchedCorrelationCodes(const {});
     await _wifi.stopScan();
     await _ble.stopScan();
   }

@@ -36,6 +36,8 @@ class BleTransportImpl implements BleTransport {
 
   static const _bleStaleTimeout = Duration(seconds: 6);
   static const _bleStaleCheckInterval = Duration(seconds: 1);
+  static const _scanEmitMinInterval = Duration(milliseconds: 400);
+  static const _rssiEmitDelta = 5;
 
   StreamController<List<BridgeDevice>>? _scanController;
   StreamSubscription? _discoveredSub;
@@ -44,6 +46,8 @@ class BleTransportImpl implements BleTransport {
   StreamSubscription? _centralNotifiedSub;
   StreamSubscription? _centralConnectionSub;
   Timer? _scanStaleTimer;
+  Timer? _scanEmitTimer;
+  DateTime? _lastScanEmitAt;
 
   GATTCharacteristic? _hostCharacteristic;
   final _subscribedCentrals = <Central>{};
@@ -55,13 +59,16 @@ class BleTransportImpl implements BleTransport {
   bool _scanning = false;
   bool _closingLink = false;
   bool _resolvingNames = false;
-  bool _nameResolveRunning = false;
 
   final _lastPeripheralById = <String, Peripheral>{};
   final _lastAdvertisementAt = <String, DateTime>{};
+  final _lastKnownCorrelationCode = <String, String>{};
   final _nameResolveQueue = Queue<String>();
   final _nameResolveQueuedOrDone = <String>{};
+  final _resolveSkippedForWifi = <String>{};
   final _resolvedNames = <String, String>{};
+  final _wifiMatchedCodes = <String>{};
+  Future<void>? _nameResolveFuture;
 
   @override
   Stream<Map<String, dynamic>> get onMessageReceived =>
@@ -198,6 +205,28 @@ class BleTransportImpl implements BleTransport {
   }
 
   @override
+  void updateWifiMatchedCorrelationCodes(Set<String> codes) {
+    final next = <String>{
+      for (final code in codes)
+        if (code.trim().isNotEmpty) code.trim().toLowerCase(),
+    };
+    final removed = _wifiMatchedCodes.difference(next);
+    _wifiMatchedCodes
+      ..clear()
+      ..addAll(next);
+    if (removed.isEmpty) return;
+
+    // Wi-Fi match lost ⇒ allow a later GATT resolve if BLE is still around.
+    for (final peripheralKey in List<String>.from(_resolveSkippedForWifi)) {
+      final code = _lastKnownCorrelationCode[peripheralKey];
+      if (code == null || removed.contains(code.toLowerCase())) {
+        _resolveSkippedForWifi.remove(peripheralKey);
+        _nameResolveQueuedOrDone.remove(peripheralKey);
+      }
+    }
+  }
+
+  @override
   Stream<List<BridgeDevice>> scanHosts({required String serviceUuid}) {
     _filterUuid = serviceUuid.trim().toLowerCase();
     final devices = <String, BridgeDevice>{};
@@ -236,6 +265,7 @@ class BleTransportImpl implements BleTransport {
             if (cached != null && cached.code != fromAdvertise.code) {
               _resolvedNames.remove(peripheralKey);
               _nameResolveQueuedOrDone.remove(peripheralKey);
+              _resolveSkippedForWifi.remove(peripheralKey);
             }
           }
 
@@ -248,6 +278,10 @@ class BleTransportImpl implements BleTransport {
               fromAdvertise?.code ??
               fromResolved?.code ??
               previous?.correlationCode;
+          if (correlationCode != null && correlationCode.isNotEmpty) {
+            _lastKnownCorrelationCode[peripheralKey] = correlationCode;
+          }
+
           final resolvedDisplay = fromResolved?.displayName.trim() ?? '';
           final nameResolved = resolvedDisplay.isNotEmpty;
           final displayName = nameResolved
@@ -264,7 +298,7 @@ class BleTransportImpl implements BleTransport {
                   peripheralId: peripheralKey,
                 );
 
-          devices[peripheralKey] = BridgeDevice(
+          final next = BridgeDevice(
             id: id,
             name: displayName,
             serviceUuid: serviceUuid,
@@ -277,24 +311,23 @@ class BleTransportImpl implements BleTransport {
             ),
             lastSeen: DateTime.now(),
           );
-          _emitScanSnapshot(controller, devices);
+          devices[peripheralKey] = next;
+          _emitScanSnapshot(
+            controller,
+            devices,
+            significant: _isSignificantScanChange(previous, next),
+          );
 
-          if (_resolvingNames &&
-              _scanning &&
-              !_nameResolveQueuedOrDone.contains(peripheralKey)) {
-            _nameResolveQueuedOrDone.add(peripheralKey);
-            _nameResolveQueue.add(peripheralKey);
-            unawaited(
-              _pumpNameResolveQueue(
-                serviceUuid: serviceUuid,
-                devices: devices,
-                controller: controller,
-              ),
-            );
-          }
+          _maybeQueueNameResolve(
+            peripheralKey: peripheralKey,
+            correlationCode: correlationCode,
+            serviceUuid: serviceUuid,
+            devices: devices,
+            controller: controller,
+          );
         });
-        await _central.startDiscovery(serviceUUIDs: [uuid]);
         _scanning = true;
+        await _central.startDiscovery(serviceUUIDs: [uuid]);
         _scanStaleTimer?.cancel();
         _scanStaleTimer = Timer.periodic(_bleStaleCheckInterval, (_) {
           _pruneStaleScanDevices(devices, controller);
@@ -316,16 +349,16 @@ class BleTransportImpl implements BleTransport {
     _nameResolveQueue.clear();
     _scanStaleTimer?.cancel();
     _scanStaleTimer = null;
+    _scanEmitTimer?.cancel();
+    _scanEmitTimer = null;
+    _lastScanEmitAt = null;
     if (_scanning) {
       await _central.stopDiscovery();
       _scanning = false;
     }
     await _discoveredSub?.cancel();
     _discoveredSub = null;
-    // Wait for in-flight name resolve to finish disconnecting.
-    while (_nameResolveRunning) {
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-    }
+    await _waitUntilNameResolveIdle();
   }
 
   /// Drop BLE sightings that stopped advertising (e.g. after remote Stop Host).
@@ -337,7 +370,7 @@ class BleTransportImpl implements BleTransport {
     if (controller.isClosed ||
         devices.isEmpty ||
         !_scanning ||
-        _nameResolveRunning) {
+        _nameResolveFuture != null) {
       return;
     }
     final now = DateTime.now();
@@ -352,15 +385,17 @@ class BleTransportImpl implements BleTransport {
     for (final key in staleKeys) {
       devices.remove(key);
       _lastAdvertisementAt.remove(key);
-      // Allow a later reappearance (new Host session) to resolve again.
+      _lastKnownCorrelationCode.remove(key);
       _nameResolveQueuedOrDone.remove(key);
+      _resolveSkippedForWifi.remove(key);
     }
-    _emitScanSnapshot(controller, devices);
+    _emitScanSnapshot(controller, devices, significant: true);
   }
 
   @override
   Future<void> stopScan() async {
     await _stopDiscoveryEngine();
+    _wifiMatchedCodes.clear();
     final controller = _scanController;
     _scanController = null;
     if (controller != null && !controller.isClosed) {
@@ -371,15 +406,93 @@ class BleTransportImpl implements BleTransport {
   void _resetNameResolveState() {
     _nameResolveQueue.clear();
     _nameResolveQueuedOrDone.clear();
+    _resolveSkippedForWifi.clear();
     // Keep _resolvedNames across stop/start within process so rediscovery is faster.
+  }
+
+  bool _isSignificantScanChange(BridgeDevice? previous, BridgeDevice next) {
+    if (previous == null) return true;
+    if (previous.id != next.id) return true;
+    if (previous.name != next.name) return true;
+    if (previous.nameResolved != next.nameResolved) return true;
+    if (previous.correlationCode != next.correlationCode) return true;
+    final prevRssi = previous.ble?.rssi;
+    final nextRssi = next.ble?.rssi;
+    if (prevRssi == null || nextRssi == null) return true;
+    return (prevRssi - nextRssi).abs() >= _rssiEmitDelta;
   }
 
   void _emitScanSnapshot(
     StreamController<List<BridgeDevice>> controller,
-    Map<String, BridgeDevice> devices,
-  ) {
+    Map<String, BridgeDevice> devices, {
+    required bool significant,
+  }) {
     if (controller.isClosed) return;
-    controller.add(devices.values.toList(growable: false));
+    final now = DateTime.now();
+    final canEmitNow = _lastScanEmitAt == null ||
+        now.difference(_lastScanEmitAt!) >= _scanEmitMinInterval;
+
+    if (significant || canEmitNow) {
+      _scanEmitTimer?.cancel();
+      _scanEmitTimer = null;
+      _lastScanEmitAt = now;
+      controller.add(devices.values.toList(growable: false));
+      return;
+    }
+
+    // RSSI-only noise: coalesce into a trailing emit.
+    _scanEmitTimer ??= Timer(_scanEmitMinInterval, () {
+      _scanEmitTimer = null;
+      if (controller.isClosed) return;
+      _lastScanEmitAt = DateTime.now();
+      controller.add(devices.values.toList(growable: false));
+    });
+  }
+
+  void _maybeQueueNameResolve({
+    required String peripheralKey,
+    required String? correlationCode,
+    required String serviceUuid,
+    required Map<String, BridgeDevice> devices,
+    required StreamController<List<BridgeDevice>> controller,
+  }) {
+    if (!_resolvingNames || !_scanning) return;
+    if (_nameResolveQueuedOrDone.contains(peripheralKey)) return;
+
+    // Already know the full wire name from a previous resolve.
+    final cached = _resolvedNames[peripheralKey];
+    if (cached != null && cached.isNotEmpty) {
+      final parsed = BridgeConstants.parseDeviceName(cached);
+      if (parsed != null && parsed.displayName.trim().isNotEmpty) {
+        _nameResolveQueuedOrDone.add(peripheralKey);
+        return;
+      }
+    }
+
+    // Wi-Fi already carries the display name for this correlation code.
+    final code = correlationCode?.trim().toLowerCase();
+    if (code != null && _wifiMatchedCodes.contains(code)) {
+      _nameResolveQueuedOrDone.add(peripheralKey);
+      _resolveSkippedForWifi.add(peripheralKey);
+      return;
+    }
+
+    _nameResolveQueuedOrDone.add(peripheralKey);
+    _nameResolveQueue.add(peripheralKey);
+    unawaited(
+      _pumpNameResolveQueue(
+        serviceUuid: serviceUuid,
+        devices: devices,
+        controller: controller,
+      ),
+    );
+  }
+
+  Future<void> _waitUntilNameResolveIdle() async {
+    final pending = _nameResolveFuture;
+    if (pending != null) {
+      await pending;
+    }
   }
 
   Future<void> _pumpNameResolveQueue({
@@ -387,50 +500,76 @@ class BleTransportImpl implements BleTransport {
     required Map<String, BridgeDevice> devices,
     required StreamController<List<BridgeDevice>> controller,
   }) async {
-    if (_nameResolveRunning) return;
-    _nameResolveRunning = true;
+    if (_nameResolveFuture != null) return;
+    final run = _runNameResolveQueue(
+      serviceUuid: serviceUuid,
+      devices: devices,
+      controller: controller,
+    );
+    _nameResolveFuture = run;
     try {
-      while (_resolvingNames && _nameResolveQueue.isNotEmpty) {
-        final peripheralKey = _nameResolveQueue.removeFirst();
-        try {
-          final fullName = await _resolvePeripheralName(peripheralKey);
-          if (!_resolvingNames) break;
-          if (fullName == null || fullName.isEmpty) continue;
-
-          _resolvedNames[peripheralKey] = fullName;
-          final existing = devices[peripheralKey];
-          if (existing == null) continue;
-
-          final parsed = BridgeConstants.parseDeviceName(fullName);
-          final correlationCode = parsed?.code ?? existing.correlationCode;
-          final displayName = parsed == null
-              ? fullName.trim()
-              : parsed.displayName.trim();
-          if (displayName.isEmpty) continue;
-
-          final id = correlationCode != null
-              ? BridgeConstants.deviceId(
-                  serviceUuid: serviceUuid,
-                  correlationCode: correlationCode,
-                )
-              : existing.id;
-
-          devices[peripheralKey] = existing.copyWith(
-            id: id,
-            name: displayName,
-            correlationCode: correlationCode,
-            nameResolved: true,
-            lastSeen: DateTime.now(),
-          );
-          _emitScanSnapshot(controller, devices);
-        } catch (_) {
-          // Keep scanning; name resolve is best-effort.
-        }
-      }
+      await run;
     } finally {
-      _nameResolveRunning = false;
-      if (_resolvingNames && _scanning == false) {
-        // Resolver paused discovery to connect; resume if still resolving.
+      if (identical(_nameResolveFuture, run)) {
+        _nameResolveFuture = null;
+      }
+      // Items may have been queued while this run was finishing.
+      if (_resolvingNames && _nameResolveQueue.isNotEmpty) {
+        unawaited(
+          _pumpNameResolveQueue(
+            serviceUuid: serviceUuid,
+            devices: devices,
+            controller: controller,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _runNameResolveQueue({
+    required String serviceUuid,
+    required Map<String, BridgeDevice> devices,
+    required StreamController<List<BridgeDevice>> controller,
+  }) async {
+    while (_resolvingNames && _nameResolveQueue.isNotEmpty) {
+      final peripheralKey = _nameResolveQueue.removeFirst();
+      try {
+        final fullName = await _resolvePeripheralName(peripheralKey);
+        if (!_resolvingNames) break;
+        if (fullName == null || fullName.isEmpty) continue;
+
+        _resolvedNames[peripheralKey] = fullName;
+        final existing = devices[peripheralKey];
+        if (existing == null) continue;
+
+        final parsed = BridgeConstants.parseDeviceName(fullName);
+        final correlationCode = parsed?.code ?? existing.correlationCode;
+        final displayName = parsed == null
+            ? fullName.trim()
+            : parsed.displayName.trim();
+        if (displayName.isEmpty) continue;
+
+        if (correlationCode != null && correlationCode.isNotEmpty) {
+          _lastKnownCorrelationCode[peripheralKey] = correlationCode;
+        }
+
+        final id = correlationCode != null
+            ? BridgeConstants.deviceId(
+                serviceUuid: serviceUuid,
+                correlationCode: correlationCode,
+              )
+            : existing.id;
+
+        devices[peripheralKey] = existing.copyWith(
+          id: id,
+          name: displayName,
+          correlationCode: correlationCode,
+          nameResolved: true,
+          lastSeen: DateTime.now(),
+        );
+        _emitScanSnapshot(controller, devices, significant: true);
+      } catch (_) {
+        // Keep scanning; name resolve is best-effort.
       }
     }
   }
@@ -503,9 +642,7 @@ class BleTransportImpl implements BleTransport {
     // Formal session connect must not race with name resolve.
     _resolvingNames = false;
     _nameResolveQueue.clear();
-    while (_nameResolveRunning) {
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-    }
+    await _waitUntilNameResolveIdle();
 
     await disconnect();
     await _ensureReady(_central);

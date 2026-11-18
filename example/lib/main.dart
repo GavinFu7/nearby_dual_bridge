@@ -65,6 +65,21 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   void initState() {
     super.initState();
     _statusSub = _bridge.addStatusListener((status) {
+      final reason = status.reason;
+      final logLine = switch (reason) {
+        'peer_connected' =>
+          'Status: peer connected · peers=${status.peerCount} '
+              '· ${status.activeTransport?.name ?? status.role.name}',
+        'peer_disconnected' =>
+          'Status: peer disconnected · peers=${status.peerCount} '
+              '· connection=${status.connectionState.name}',
+        'connected' =>
+          'Status: connected via ${status.activeTransport?.name}',
+        'disconnected' || 'connect_failed' || 'host_stopped' =>
+          'Status: $reason',
+        _ => null,
+      };
+
       setState(() {
         _role = status.role;
         _connectionState = status.connectionState;
@@ -79,29 +94,14 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
             status.connectionState == BridgeConnectionState.disconnecting) {
           _connectedDevice = null;
         }
+        if (logLine != null) {
+          final stamp = TimeOfDay.now().format(context);
+          _logs.insert(0, '[$stamp] $logLine');
+          if (_logs.length > 80) {
+            _logs.removeLast();
+          }
+        }
       });
-      final reason = status.reason;
-      if (reason == null) return;
-      switch (reason) {
-        case 'peer_connected':
-          _appendLog(
-            'Status: peer connected · peers=${status.peerCount} '
-            '· ${status.activeTransport?.name ?? status.role.name}',
-          );
-        case 'peer_disconnected':
-          _appendLog(
-            'Status: peer disconnected · peers=${status.peerCount} '
-            '· connection=${status.connectionState.name}',
-          );
-        case 'connected':
-          _appendLog('Status: connected via ${status.activeTransport?.name}');
-        case 'disconnected':
-        case 'connect_failed':
-        case 'host_stopped':
-          _appendLog('Status: $reason');
-        default:
-          break;
-      }
     });
     _messageSub = _bridge.onMessageReceived.listen((message) {
       _appendLog('← $message');

@@ -98,7 +98,11 @@ abstract final class BridgeConstants {
   static bool isCorrelationCode(String value) {
     if (value.length != correlationCodeLength) return false;
     for (var i = 0; i < value.length; i++) {
-      if (!correlationCodeAlphabet.contains(value[i])) return false;
+      final c = value.codeUnitAt(i);
+      final isUpper = c >= 65 && c <= 90;
+      final isLower = c >= 97 && c <= 122;
+      final isDigit = c >= 48 && c <= 57;
+      if (!isUpper && !isLower && !isDigit) return false;
     }
     return true;
   }

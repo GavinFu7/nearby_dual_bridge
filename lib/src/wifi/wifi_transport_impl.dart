@@ -21,7 +21,7 @@ class WifiTransportImpl implements WifiTransport {
   Registration? _registration;
   Discovery? _discovery;
   StreamController<List<BridgeDevice>>? _scanController;
-  StreamSubscription? _discoveryListener;
+  ServiceListener? _serviceListener;
   final _sockets = <WebSocket>{};
   final _messageController =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -107,7 +107,7 @@ class WifiTransportImpl implements WifiTransport {
             ipLookupType: IpLookupType.v4,
           );
           _discovery = discovery;
-          discovery.addServiceListener((service, status) {
+          void listener(Service service, ServiceStatus status) {
             final device = _deviceFromService(service);
             if (device == null) return;
             if (status == ServiceStatus.found) {
@@ -118,7 +118,10 @@ class WifiTransportImpl implements WifiTransport {
             if (!controller.isClosed) {
               controller.add(devices.values.toList(growable: false));
             }
-          });
+          }
+
+          _serviceListener = listener;
+          discovery.addServiceListener(listener);
         } catch (error, stackTrace) {
           if (!controller.isClosed) {
             controller.addError(error, stackTrace);
@@ -137,10 +140,13 @@ class WifiTransportImpl implements WifiTransport {
   }
 
   Future<void> _stopDiscoveryEngine() async {
-    await _discoveryListener?.cancel();
-    _discoveryListener = null;
+    final listener = _serviceListener;
+    _serviceListener = null;
     final discovery = _discovery;
     _discovery = null;
+    if (discovery != null && listener != null) {
+      discovery.removeServiceListener(listener);
+    }
     if (discovery != null) {
       await stopDiscovery(discovery);
     }

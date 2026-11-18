@@ -30,7 +30,7 @@ bridge
       ble: true,
     )
     .listen((devices) {
-  // merged Wi-Fi + BLE sightings
+  // merged Wi-Fi + BLE sightings (continuous until stopScan)
 });
 
 await bridge.connect(
@@ -70,16 +70,25 @@ Consumers must declare platform permissions. The `example/` app already includes
 | mDNS type | `_ndb._tcp` |
 | Default service UUID | `a1b2c3d0-e5f6-4789-abcd-ef0123456789` |
 | Message GATT characteristic | `a1b2c3d1-e5f6-4789-abcd-ef0123456789` |
+| Device-name GATT characteristic | `a1b2c3d2-e5f6-4789-abcd-ef0123456789` |
 | Device merge key | `serviceUuid\|correlationCode` (8-char Host prefix) |
 | Connect default | Prefer Wi-Fi, fall back to BLE |
 
+## Discovery & naming
+
+- Host `deviceName` is prefixed with a hidden **8-char correlation code** (not shown in UI).
+- Matching codes merge Wi-Fi + BLE into one `BridgeDevice` and prefer the **Wi-Fi display name**.
+- BLE advertise Local Name is the correlation code only (Apple payload limits). Full `code + name` is on the readable device-name GATT characteristic.
+- Client scan keeps updating until `stopScan`. BLE-only Hosts are shown only after GATT name resolve (skipped when Wi-Fi already matched the same code).
+- If a Host was seen on Wi-Fi and Wi-Fi later drops from the scan list, BLE leftovers for that Host are hidden until rediscovery.
+- After remote `stopHost`, BLE advertisements stop and stale BLE scan rows expire (~6s without ads).
+- BLE scan emissions are throttled: identity / name changes emit immediately; RSSI-only updates are coalesced.
+
 ## Notes
 
-- Host `deviceName` is prefixed with a hidden 8-char correlation code (not shown in UI). Matching codes merge Wi-Fi + BLE into one `BridgeDevice` and prefer the Wi-Fi display name.
-- If a Host was seen on Wi-Fi and Wi-Fi later drops from the scan list, BLE leftovers for that Host are hidden too until the device is rediscovered.
-- BLE advertise Local Name is the correlation code only (Apple payload limits). Full `code + name` is on a readable GATT characteristic; Client scan auto-connects to resolve BLE-only Hosts before showing them.
 - WebSocket connect prefers mDNS hostname / IPv4 (link-local IPv6 is skipped).
 - `addStatusListener` / `onStatusChanged` report `peer_connected` and `peer_disconnected` for both Host and Client.
+- `stopHost` tears down Wi-Fi (mDNS + WebSocket server) and BLE advertising / GATT services.
 
 ## Dependencies
 

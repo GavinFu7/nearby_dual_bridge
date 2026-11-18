@@ -20,6 +20,11 @@ abstract class BleTransport {
 
   Future<void> stopScan();
 
+  /// Hint from the manager: correlation codes already visible over Wi-Fi.
+  ///
+  /// Implementations may skip GATT name resolve for matching BLE sightings.
+  void updateWifiMatchedCorrelationCodes(Set<String> codes) {}
+
   /// Connect as Central to a discovered Peripheral.
   Future<void> connect(
     BleEndpoint endpoint, {
