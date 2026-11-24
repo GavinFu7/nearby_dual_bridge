@@ -1,12 +1,20 @@
 name: nearby_dual_bridge
 description: "A cross-platform, dual-role proximity bridge. It can dynamically act as a host or client via Wi-Fi (mDNS + WebSocket) and connect via BLE (center/peripheral)."
-version: 0.0.3
+version: 0.0.4
 homepage: https://github.com/GavinFu7
 repository: https://github.com/GavinFu7/nearby_dual_bridge
 
 environment:
   sdk: ^3.13.7
   flutter: '>=3.41.0'
+
+# Explicit platforms: pub.dev auto-detect intersects plugin deps, and
+# permission_handler has no macOS (but Android/iOS/Windows), which wrongly
+# dropped macOS and kept Windows. This package targets Android / iOS / macOS.
+platforms:
+  android:
+  ios:
+  macos:
 
 dependencies:
   flutter:

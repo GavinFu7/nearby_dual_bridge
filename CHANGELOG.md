@@ -1,3 +1,7 @@
+## 0.0.4
+
+* Declare supported platforms explicitly as Android, iOS, and macOS in `pubspec.yaml` so pub.dev no longer shows Windows (auto-detect was skewed by `permission_handler`).
+
 ## 0.0.3
 
 * Skip BLE GATT name resolve when Wi-Fi already matched the same correlation code (or the name was resolved earlier).
