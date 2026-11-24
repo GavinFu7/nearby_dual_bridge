@@ -1,6 +1,6 @@
 ## 0.0.5
 
-* Declare supported platforms explicitly as Android, iOS, macOS, and Windows in `pubspec.yaml` so pub.dev no longer shows Windows (auto-detect was skewed by `permission_handler`).
+* Declare supported platforms explicitly as Android, iOS, macOS, and Windows in `pubspec.yaml` (auto-detect had dropped macOS because `permission_handler` has no macOS entry).
 
 ## 0.0.3
 
