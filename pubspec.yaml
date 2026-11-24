@@ -1,6 +1,6 @@
 name: nearby_dual_bridge
 description: "A cross-platform, dual-role proximity bridge. It can dynamically act as a host or client via Wi-Fi (mDNS + WebSocket) and connect via BLE (center/peripheral)."
-version: 0.0.5
+version: 0.0.6
 homepage: https://github.com/GavinFu7
 repository: https://github.com/GavinFu7/nearby_dual_bridge
 

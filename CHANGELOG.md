@@ -1,3 +1,7 @@
+## 0.0.6
+
+* Add an 8-second timeout to Wi-Fi WebSocket connect attempts, and close orphan sockets if a timed-out connect completes later.
+
 ## 0.0.5
 
 * Declare supported platforms explicitly as Android, iOS, macOS, and Windows in `pubspec.yaml` (auto-detect had dropped macOS because `permission_handler` has no macOS entry).

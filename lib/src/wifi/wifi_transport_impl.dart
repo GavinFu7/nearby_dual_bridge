@@ -162,18 +162,27 @@ class WifiTransportImpl implements WifiTransport {
     }
   }
 
+  static const _wifiConnectTimeout = Duration(seconds: 8);
+
   @override
   Future<void> connect(WifiEndpoint endpoint) async {
     await disconnect();
 
     Object? lastError;
     for (final uri in endpoint.connectionCandidates) {
+      final connectFuture = WebSocket.connect(uri.toString());
       try {
-        final socket = await WebSocket.connect(uri.toString());
+        final socket = await connectFuture.timeout(_wifiConnectTimeout);
         _clientSocket = socket;
         _sockets.add(socket);
         _attachSocket(socket, emitConnected: true);
         return;
+      } on TimeoutException catch (error) {
+        lastError = error;
+        // Timed-out connect may still complete later; close orphan sockets.
+        unawaited(
+          connectFuture.then((ws) => ws.close()).catchError((_) {}),
+        );
       } catch (error) {
         lastError = error;
       }
