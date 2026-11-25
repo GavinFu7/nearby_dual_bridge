@@ -8,5 +8,6 @@ export 'connection_preference.dart';
 export 'host_session.dart';
 export 'transport_type.dart';
 export 'wifi_endpoint.dart';
+export 'wifi_host_result.dart';
 
 

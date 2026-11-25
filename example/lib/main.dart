@@ -172,14 +172,21 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
         );
         setState(() => _hosting = true);
         _appendLog(
-          'Host OK · Wi-Fi ${session.wifi.host}:${session.wifi.port} · '
-          'mDNS ${BridgeConstants.mdnsServiceType}',
+          'Host OK · Wi-Fi ${session.wifi.host}:${session.wifi.port}',
         );
+        if (session.mdnsRegistered) {
+          _appendLog('mDNS OK · ${BridgeConstants.mdnsServiceType}');
+        } else {
+          _appendLog('mDNS FAILED: ${session.mdnsError}');
+          _appendLog(
+            'WebSocket Host is still running — check Local Network permission '
+            '(System Settings → Privacy & Security → Local Network)',
+          );
+        }
         if (session.bleAdvertising) {
           _appendLog('BLE advertising OK (Local Name = 8-char correlation code)');
         } else {
           _appendLog('BLE advertising FAILED: ${session.bleError}');
-          _appendLog('Wi-Fi Host is still running — you can test mDNS first');
         }
       } catch (error) {
         _appendLog('Host error: $error');

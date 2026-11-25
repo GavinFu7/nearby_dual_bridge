@@ -1,6 +1,7 @@
 import '../models/bridge_device.dart';
 import '../models/bridge_peer_event.dart';
 import '../models/wifi_endpoint.dart';
+import '../models/wifi_host_result.dart';
 
 /// Abstraction for Wi-Fi discovery (mDNS) and data plane (HttpServer / WebSocket).
 abstract class WifiTransport {
@@ -8,7 +9,10 @@ abstract class WifiTransport {
   Stream<BridgePeerEvent> get onPeerConnectionChanged;
 
   /// Start local WebSocket server and register mDNS service.
-  Future<WifiEndpoint> startHost({
+  ///
+  /// WebSocket bind failures throw. mDNS register timeout / failure is reported
+  /// in [WifiHostResult.mdnsError] without tearing down the server.
+  Future<WifiHostResult> startHost({
     required String deviceName,
     required String serviceUuid,
     int? port,

@@ -9,6 +9,7 @@ import '../models/bridge_device.dart';
 import '../models/bridge_peer_event.dart';
 import '../models/transport_type.dart';
 import '../models/wifi_endpoint.dart';
+import '../models/wifi_host_result.dart';
 import '../protocol/message_codec.dart';
 
 /// Wi-Fi transport: mDNS (`nsd`) + WebSocket (`dart:io`).
@@ -39,7 +40,7 @@ class WifiTransportImpl implements WifiTransport {
       _peerController.stream;
 
   @override
-  Future<WifiEndpoint> startHost({
+  Future<WifiHostResult> startHost({
     required String deviceName,
     required String serviceUuid,
     int? port,
@@ -56,7 +57,7 @@ class WifiTransportImpl implements WifiTransport {
       serviceName: deviceName,
     );
 
-    _registration = await register(
+    final registerFuture = register(
       Service(
         name: deviceName,
         type: BridgeConstants.mdnsServiceType,
@@ -67,8 +68,38 @@ class WifiTransportImpl implements WifiTransport {
         ),
       ),
     );
-
-    return endpoint;
+    try {
+      _registration = await registerFuture.timeout(_mdnsRegisterTimeout);
+      return WifiHostResult(
+        endpoint: endpoint,
+        mdnsRegistered: true,
+      );
+    } on TimeoutException catch (error) {
+      // Don't block Host start: WebSocket is already up. If Bonjour finishes
+      // later while this server is still running, keep the registration;
+      // otherwise unregister so we don't leak a stale advertisement.
+      unawaited(() async {
+        try {
+          final reg = await registerFuture;
+          if (!identical(_server, server)) {
+            await unregister(reg);
+            return;
+          }
+          _registration = reg;
+        } catch (_) {}
+      }());
+      return WifiHostResult(
+        endpoint: endpoint,
+        mdnsRegistered: false,
+        mdnsError: error,
+      );
+    } catch (error) {
+      return WifiHostResult(
+        endpoint: endpoint,
+        mdnsRegistered: false,
+        mdnsError: error,
+      );
+    }
   }
 
   @override
@@ -162,7 +193,8 @@ class WifiTransportImpl implements WifiTransport {
     }
   }
 
-  static const _wifiConnectTimeout = Duration(seconds: 8);
+  static const _mdnsRegisterTimeout = Duration(seconds: 3);
+  static const _wifiConnectTimeout = Duration(seconds: 3);
 
   @override
   Future<void> connect(WifiEndpoint endpoint) async {

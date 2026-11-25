@@ -1,5 +1,7 @@
 ## 0.0.6
 
+* Report mDNS register status on `HostSession` (`mdnsRegistered` / `mdnsError`), mirroring BLE advertise fields.
+* Add a 3-second timeout to mDNS (Bonjour) `register` in `startHost`: Host proceeds with the WebSocket server if register is slow or fails; a late registration is kept if still hosting, otherwise unregistered.
 * Add an 8-second timeout to Wi-Fi WebSocket connect attempts, and close orphan sockets if a timed-out connect completes later.
 
 ## 0.0.5

@@ -103,9 +103,9 @@ class DualBridgeManager {
   /// automatically for Wi-Fi + BLE; Clients strip it before showing the name and
   /// use it to merge dual-transport sightings of the same Host.
   ///
-  /// Wi-Fi Host is required. BLE advertise failures are reported in
-  /// [HostSession.bleError] without tearing down Wi-Fi, so you can still test
-  /// mDNS / WebSocket while debugging Bluetooth.
+  /// Wi-Fi WebSocket Host is required. mDNS register and BLE advertise failures
+  /// are reported in [HostSession.mdnsError] / [HostSession.bleError] without
+  /// tearing down the WebSocket server.
   Future<HostSession> startHost({
     required String deviceName,
     required String serviceUuid,
@@ -145,7 +145,9 @@ class DualBridgeManager {
 
     _setRole(BridgeRole.host, reason: 'host_started');
     return HostSession(
-      wifi: wifi,
+      wifi: wifi.endpoint,
+      mdnsRegistered: wifi.mdnsRegistered,
+      mdnsError: wifi.mdnsError,
       bleAdvertising: bleAdvertising,
       bleError: bleError,
     );
