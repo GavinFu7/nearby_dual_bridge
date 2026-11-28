@@ -1,6 +1,6 @@
 # nearby_dual_bridge
 
-Cross-platform dual-role nearby bridge for **Android**, **iOS**, and **macOS**.
+Cross-platform dual-role nearby bridge for **Android**, **iOS**, **macOS**, and **Windows**.
 
 Each device can dynamically act as **Host** (server / controlled) or **Client** (controller) over:
 
