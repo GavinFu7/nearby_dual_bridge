@@ -7,6 +7,7 @@ import 'interfaces/bridge_permissions.dart';
 import 'interfaces/wifi_transport.dart';
 import 'models/bridge_connection_state.dart';
 import 'models/bridge_device.dart';
+import 'models/bridge_peer.dart';
 import 'models/bridge_peer_event.dart';
 import 'models/bridge_role.dart';
 import 'models/bridge_status.dart';
@@ -42,6 +43,10 @@ class DualBridgeManager {
       StreamController<BridgeConnectionState>.broadcast();
   final _roleController = StreamController<BridgeRole>.broadcast();
   final _statusController = StreamController<BridgeStatus>.broadcast();
+  final _hostPeersController =
+      StreamController<List<BridgePeer>>.broadcast();
+  final _peerEventController =
+      StreamController<BridgePeerEvent>.broadcast();
 
   StreamSubscription? _wifiMessageSub;
   StreamSubscription? _bleMessageSub;
@@ -57,6 +62,7 @@ class DualBridgeManager {
   int _wifiPeers = 0;
   int _blePeers = 0;
   bool _localDisconnect = false;
+  final _hostPeersById = <String, BridgePeer>{};
 
   BridgeRole get role => _role;
 
@@ -85,6 +91,17 @@ class DualBridgeManager {
   Stream<Map<String, dynamic>> get onMessageReceived =>
       _messageController.stream;
 
+  /// Host-side peers (pending approval + connected) across Wi-Fi and BLE.
+  List<BridgePeer> get hostPeers =>
+      _hostPeersById.values.toList(growable: false);
+
+  /// Emits whenever [hostPeers] changes.
+  Stream<List<BridgePeer>> get onHostPeersChanged =>
+      _hostPeersController.stream;
+
+  /// Detailed Host/Client peer lifecycle events (includes [BridgePeer]).
+  Stream<BridgePeerEvent> get onPeerEvent => _peerEventController.stream;
+
   /// Convenience listener; emits the current [status] immediately, then updates.
   StreamSubscription<BridgeStatus> addStatusListener(
     void Function(BridgeStatus status) listener,
@@ -106,15 +123,20 @@ class DualBridgeManager {
   /// Wi-Fi WebSocket Host is required. mDNS register and BLE advertise failures
   /// are reported in [HostSession.mdnsError] / [HostSession.bleError] without
   /// tearing down the WebSocket server.
+  ///
+  /// When [requireConnectionApproval] is true (default), incoming Clients emit
+  /// [BridgePeerEventType.connectionRequest] until [approvePeer] / [rejectPeer].
   Future<HostSession> startHost({
     required String deviceName,
     required String serviceUuid,
+    bool requireConnectionApproval = true,
   }) async {
     if (_role == BridgeRole.client &&
         _connectionState != BridgeConnectionState.disconnected) {
       await disconnect();
     }
     await stopScan();
+    _clearHostPeers();
 
     final granted = await _permissions.ensureHostPermissions();
     if (!granted) {
@@ -129,6 +151,7 @@ class DualBridgeManager {
     final wifi = await _wifi.startHost(
       deviceName: wireName,
       serviceUuid: serviceUuid,
+      requireConnectionApproval: requireConnectionApproval,
     );
 
     Object? bleError;
@@ -137,6 +160,7 @@ class DualBridgeManager {
       await _ble.startHost(
         deviceName: wireName,
         serviceUuid: serviceUuid,
+        requireConnectionApproval: requireConnectionApproval,
       );
       bleAdvertising = true;
     } catch (error) {
@@ -151,6 +175,48 @@ class DualBridgeManager {
       bleAdvertising: bleAdvertising,
       bleError: bleError,
     );
+  }
+
+  /// Approve a pending Host peer (Wi-Fi or BLE).
+  Future<void> approvePeer(String peerId) async {
+    _ensureHost();
+    if (peerId.startsWith('wifi:')) {
+      await _wifi.approvePeer(peerId);
+    } else if (peerId.startsWith('ble:')) {
+      await _ble.approvePeer(peerId);
+    } else {
+      throw StateError('Unknown peer id: $peerId');
+    }
+  }
+
+  /// Reject a pending Host peer and drop the link when possible.
+  Future<void> rejectPeer(String peerId) async {
+    _ensureHost();
+    if (peerId.startsWith('wifi:')) {
+      await _wifi.rejectPeer(peerId);
+    } else if (peerId.startsWith('ble:')) {
+      await _ble.rejectPeer(peerId);
+    } else {
+      throw StateError('Unknown peer id: $peerId');
+    }
+  }
+
+  /// Disconnect / kick a Host peer by id (pending or connected).
+  Future<void> disconnectPeer(String peerId) async {
+    _ensureHost();
+    if (peerId.startsWith('wifi:')) {
+      await _wifi.disconnectPeer(peerId);
+    } else if (peerId.startsWith('ble:')) {
+      await _ble.disconnectPeer(peerId);
+    } else {
+      throw StateError('Unknown peer id: $peerId');
+    }
+  }
+
+  void _ensureHost() {
+    if (_role != BridgeRole.host) {
+      throw StateError('Not in Host mode');
+    }
   }
 
   /// Stop Host mode and tear down all advertisements / servers.
@@ -174,6 +240,7 @@ class DualBridgeManager {
     }
     _wifiPeers = 0;
     _blePeers = 0;
+    _clearHostPeers();
     if (_role == BridgeRole.host) {
       _setRole(BridgeRole.idle, reason: 'host_stopped');
     }
@@ -463,25 +530,61 @@ class DualBridgeManager {
     await _connectionStateController.close();
     await _roleController.close();
     await _statusController.close();
+    await _hostPeersController.close();
+    await _peerEventController.close();
   }
 
   void _onWifiPeerEvent(BridgePeerEvent event) {
     _wifiPeers = event.peerCount;
+    _trackHostPeer(event);
     _handlePeerEvent(event);
   }
 
   void _onBlePeerEvent(BridgePeerEvent event) {
     _blePeers = event.peerCount;
+    _trackHostPeer(event);
     _handlePeerEvent(event);
   }
 
+  void _trackHostPeer(BridgePeerEvent event) {
+    final peer = event.peer;
+    if (peer != null) {
+      switch (event.type) {
+        case BridgePeerEventType.connectionRequest:
+        case BridgePeerEventType.connected:
+          _hostPeersById[peer.id] = peer;
+        case BridgePeerEventType.rejected:
+        case BridgePeerEventType.disconnected:
+          _hostPeersById.remove(peer.id);
+      }
+      _emitHostPeers();
+    }
+    if (!_peerEventController.isClosed) {
+      _peerEventController.add(event);
+    }
+  }
+
+  void _clearHostPeers() {
+    if (_hostPeersById.isEmpty) return;
+    _hostPeersById.clear();
+    _emitHostPeers();
+  }
+
+  void _emitHostPeers() {
+    if (_hostPeersController.isClosed) return;
+    _hostPeersController.add(hostPeers);
+  }
+
   void _handlePeerEvent(BridgePeerEvent event) {
+    final reason = switch (event.type) {
+      BridgePeerEventType.connectionRequest => 'peer_connection_request',
+      BridgePeerEventType.connected => 'peer_connected',
+      BridgePeerEventType.rejected => 'peer_rejected',
+      BridgePeerEventType.disconnected => 'peer_disconnected',
+    };
+
     if (_localDisconnect) {
-      _emitStatus(
-        reason: event.type == BridgePeerEventType.connected
-            ? 'peer_connected'
-            : 'peer_disconnected',
-      );
+      _emitStatus(reason: reason);
       return;
     }
 
@@ -497,11 +600,7 @@ class DualBridgeManager {
       return;
     }
 
-    _emitStatus(
-      reason: event.type == BridgePeerEventType.connected
-          ? 'peer_connected'
-          : 'peer_disconnected',
-    );
+    _emitStatus(reason: reason);
   }
 
   int get _peerCount {

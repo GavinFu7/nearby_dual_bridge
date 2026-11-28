@@ -10,9 +10,22 @@ import '../bridge_constants.dart';
 import '../interfaces/ble_transport.dart';
 import '../models/ble_endpoint.dart';
 import '../models/bridge_device.dart';
+import '../models/bridge_peer.dart';
 import '../models/bridge_peer_event.dart';
 import '../models/transport_type.dart';
 import '../protocol/ble_chunk_protocol.dart';
+
+class _BleHostPeer {
+  _BleHostPeer({
+    required this.id,
+    required this.central,
+    required this.peer,
+  });
+
+  final String id;
+  final Central central;
+  BridgePeer peer;
+}
 
 /// BLE dual-role transport via `bluetooth_low_energy`.
 class BleTransportImpl implements BleTransport {
@@ -50,7 +63,7 @@ class BleTransportImpl implements BleTransport {
   DateTime? _lastScanEmitAt;
 
   GATTCharacteristic? _hostCharacteristic;
-  final _subscribedCentrals = <Central>{};
+  final _hostPeers = <String, _BleHostPeer>{};
   Peripheral? _connectedPeripheral;
   GATTCharacteristic? _clientCharacteristic;
   String? _filterUuid;
@@ -59,6 +72,7 @@ class BleTransportImpl implements BleTransport {
   bool _scanning = false;
   bool _closingLink = false;
   bool _resolvingNames = false;
+  bool _requireConnectionApproval = true;
 
   final _lastPeripheralById = <String, Peripheral>{};
   final _lastAdvertisementAt = <String, DateTime>{};
@@ -79,12 +93,18 @@ class BleTransportImpl implements BleTransport {
       _peerController.stream;
 
   @override
+  List<BridgePeer> get hostPeers =>
+      _hostPeers.values.map((e) => e.peer).toList(growable: false);
+
+  @override
   Future<void> startHost({
     required String deviceName,
     required String serviceUuid,
+    bool requireConnectionApproval = true,
   }) async {
     await stopHost();
     await _ensureReady(_peripheral);
+    _requireConnectionApproval = requireConnectionApproval;
 
     _hostDeviceName = deviceName.trim().isEmpty ? 'NDB' : deviceName.trim();
     final serviceUuidObj = UUID.fromString(serviceUuid);
@@ -126,6 +146,18 @@ class BleTransportImpl implements BleTransport {
     _writeSub = _peripheral.characteristicWriteRequested.listen(
       (event) async {
         if (event.characteristic.uuid != charUuid) return;
+        final peerId = _blePeerId(event.central);
+        final session = _hostPeers[peerId];
+        if (session == null ||
+            session.peer.state != BridgePeerState.connected) {
+          try {
+            await _peripheral.respondWriteRequestWithError(
+              event.request,
+              error: GATTError.insufficientAuthorization,
+            );
+          } catch (_) {}
+          return;
+        }
         try {
           final message = _hostReassembler.add(
             Uint8List.fromList(event.request.value),
@@ -146,15 +178,37 @@ class BleTransportImpl implements BleTransport {
     _notifyStateSub =
         _peripheral.characteristicNotifyStateChanged.listen((event) {
       if (event.characteristic.uuid != charUuid) return;
+      final central = event.central;
+      final peerId = _blePeerId(central);
       if (event.state) {
-        final added = _subscribedCentrals.add(event.central);
-        if (added) {
-          _emitPeer(BridgePeerEventType.connected);
+        if (_hostPeers.containsKey(peerId)) return;
+        final peer = BridgePeer(
+          id: peerId,
+          transport: TransportType.ble,
+          state: _requireConnectionApproval
+              ? BridgePeerState.pending
+              : BridgePeerState.connected,
+          label: _shortUuid(central.uuid.toString()),
+          remoteAddress: central.uuid.toString().toLowerCase(),
+          connectedAt: DateTime.now(),
+        );
+        _hostPeers[peerId] = _BleHostPeer(
+          id: peerId,
+          central: central,
+          peer: peer,
+        );
+        if (_requireConnectionApproval) {
+          _emitPeer(BridgePeerEventType.connectionRequest, peer: peer);
+        } else {
+          _emitPeer(BridgePeerEventType.connected, peer: peer);
         }
       } else {
-        final removed = _subscribedCentrals.remove(event.central);
-        if (removed) {
-          _emitPeer(BridgePeerEventType.disconnected);
+        final removed = _hostPeers.remove(peerId);
+        if (removed != null) {
+          _emitPeer(
+            BridgePeerEventType.disconnected,
+            peer: removed.peer,
+          );
         }
       }
     });
@@ -200,8 +254,62 @@ class BleTransportImpl implements BleTransport {
     _notifyStateSub = null;
     _hostCharacteristic = null;
     _hostDeviceName = null;
-    _subscribedCentrals.clear();
+    _hostPeers.clear();
     _hostReassembler.reset();
+  }
+
+  @override
+  Future<void> approvePeer(String peerId) async {
+    final session = _hostPeers[peerId];
+    if (session == null) {
+      throw StateError('Unknown BLE peer: $peerId');
+    }
+    if (session.peer.state == BridgePeerState.connected) return;
+    session.peer = session.peer.copyWith(state: BridgePeerState.connected);
+    _emitPeer(BridgePeerEventType.connected, peer: session.peer);
+  }
+
+  @override
+  Future<void> rejectPeer(String peerId) async {
+    final session = _hostPeers[peerId];
+    if (session == null) {
+      throw StateError('Unknown BLE peer: $peerId');
+    }
+    if (session.peer.state != BridgePeerState.pending) {
+      throw StateError('BLE peer $peerId is not pending');
+    }
+    final peer = session.peer;
+    _hostPeers.remove(peerId);
+    await _tryDisconnectCentral(session.central);
+    _emitPeer(BridgePeerEventType.rejected, peer: peer);
+  }
+
+  @override
+  Future<void> disconnectPeer(String peerId) async {
+    final session = _hostPeers[peerId];
+    if (session == null) {
+      throw StateError('Unknown BLE peer: $peerId');
+    }
+    final peer = session.peer;
+    _hostPeers.remove(peerId);
+    await _tryDisconnectCentral(session.central);
+    _emitPeer(BridgePeerEventType.disconnected, peer: peer);
+  }
+
+  Future<void> _tryDisconnectCentral(Central central) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _peripheral.disconnect(central);
+    } catch (_) {}
+  }
+
+  String _blePeerId(Central central) =>
+      'ble:${central.uuid.toString().toLowerCase()}';
+
+  String _shortUuid(String uuid) {
+    final normalized = uuid.toLowerCase();
+    if (normalized.length <= 8) return normalized;
+    return normalized.substring(normalized.length - 8);
   }
 
   @override
@@ -745,10 +853,14 @@ class BleTransportImpl implements BleTransport {
   Future<void> sendMessage(Map<String, dynamic> data) async {
     final frames = _protocol.encode(data);
 
-    // Host path: notify subscribed centrals.
+    // Host path: notify approved centrals only.
     final hostChar = _hostCharacteristic;
-    if (_hosting && hostChar != null && _subscribedCentrals.isNotEmpty) {
-      for (final central in List<Central>.from(_subscribedCentrals)) {
+    final approved = _hostPeers.values
+        .where((s) => s.peer.state == BridgePeerState.connected)
+        .toList(growable: false);
+    if (_hosting && hostChar != null && approved.isNotEmpty) {
+      for (final session in approved) {
+        final central = session.central;
         for (final frame in frames) {
           final maxLen =
               await _peripheral.getMaximumNotifyLength(central);
@@ -826,16 +938,19 @@ class BleTransportImpl implements BleTransport {
 
   int get _peerCount {
     if (_connectedPeripheral != null) return 1;
-    return _subscribedCentrals.length;
+    return _hostPeers.values
+        .where((s) => s.peer.state == BridgePeerState.connected)
+        .length;
   }
 
-  void _emitPeer(BridgePeerEventType type) {
+  void _emitPeer(BridgePeerEventType type, {BridgePeer? peer}) {
     if (_peerController.isClosed) return;
     _peerController.add(
       BridgePeerEvent(
         transport: TransportType.ble,
         type: type,
         peerCount: _peerCount,
+        peer: peer,
       ),
     );
   }

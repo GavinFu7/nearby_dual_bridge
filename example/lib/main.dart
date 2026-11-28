@@ -55,10 +55,12 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   bool _scanning = false;
   bool _busy = false;
   List<BridgeDevice> _devices = const [];
+  List<BridgePeer> _hostPeers = const [];
   BridgeDevice? _connectedDevice;
   StreamSubscription? _scanSub;
   StreamSubscription? _messageSub;
   StreamSubscription? _statusSub;
+  StreamSubscription? _hostPeersSub;
   int _peerCount = 0;
 
   @override
@@ -67,9 +69,12 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     _statusSub = _bridge.addStatusListener((status) {
       final reason = status.reason;
       final logLine = switch (reason) {
+        'peer_connection_request' =>
+          'Status: connection request · peers=${status.peerCount}',
         'peer_connected' =>
           'Status: peer connected · peers=${status.peerCount} '
               '· ${status.activeTransport?.name ?? status.role.name}',
+        'peer_rejected' => 'Status: peer rejected',
         'peer_disconnected' =>
           'Status: peer disconnected · peers=${status.peerCount} '
               '· connection=${status.connectionState.name}',
@@ -89,6 +94,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
           _hosting = true;
         } else if (status.reason == 'host_stopped') {
           _hosting = false;
+          _hostPeers = const [];
         }
         if (status.connectionState == BridgeConnectionState.disconnected ||
             status.connectionState == BridgeConnectionState.disconnecting) {
@@ -102,6 +108,10 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
           }
         }
       });
+    });
+    _hostPeersSub = _bridge.onHostPeersChanged.listen((peers) {
+      if (!mounted) return;
+      setState(() => _hostPeers = peers);
     });
     _messageSub = _bridge.onMessageReceived.listen((message) {
       _appendLog('← $message');
@@ -130,6 +140,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     unawaited(_scanSub?.cancel());
     unawaited(_messageSub?.cancel());
     unawaited(_statusSub?.cancel());
+    unawaited(_hostPeersSub?.cancel());
     unawaited(_bridge.dispose());
     _deviceNameController.dispose();
     _serviceUuidController.dispose();
@@ -286,6 +297,33 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
         _appendLog('Disconnect error: $error');
       }
     });
+  }
+
+  Future<void> _approvePeer(BridgePeer peer) async {
+    try {
+      await _bridge.approvePeer(peer.id);
+      _appendLog('Approved ${peer.transport.name} ${peer.label ?? peer.id}');
+    } catch (error) {
+      _appendLog('Approve error: $error');
+    }
+  }
+
+  Future<void> _rejectPeer(BridgePeer peer) async {
+    try {
+      await _bridge.rejectPeer(peer.id);
+      _appendLog('Rejected ${peer.transport.name} ${peer.label ?? peer.id}');
+    } catch (error) {
+      _appendLog('Reject error: $error');
+    }
+  }
+
+  Future<void> _kickPeer(BridgePeer peer) async {
+    try {
+      await _bridge.disconnectPeer(peer.id);
+      _appendLog('Kicked ${peer.transport.name} ${peer.label ?? peer.id}');
+    } catch (error) {
+      _appendLog('Kick error: $error');
+    }
   }
 
   bool _isConnectedTo(BridgeDevice device) {
@@ -462,6 +500,67 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                       ),
                   ],
                 ),
+                if (_hosting) ...[
+                  const SizedBox(height: 20),
+                  Text(
+                    'Host peers (${_hostPeers.length})',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  if (_hostPeers.isEmpty)
+                    const Card(
+                      child: ListTile(
+                        leading: Icon(Icons.person_off_outlined),
+                        title: Text('No clients yet'),
+                        subtitle: Text(
+                          'Incoming connections need Approve before messaging.',
+                        ),
+                      ),
+                    )
+                  else
+                    ..._hostPeers.map((peer) {
+                      final pending = peer.isPending;
+                      return Card(
+                        child: ListTile(
+                          leading: Icon(
+                            peer.transport == TransportType.wifi
+                                ? Icons.wifi
+                                : Icons.bluetooth,
+                          ),
+                          title: Text(peer.label ?? peer.id),
+                          subtitle: Text(
+                            '${peer.transport.name} · ${peer.state.name}',
+                          ),
+                          trailing: pending
+                              ? Wrap(
+                                  spacing: 4,
+                                  children: [
+                                    IconButton(
+                                      tooltip: 'Reject',
+                                      onPressed: _busy
+                                          ? null
+                                          : () => _rejectPeer(peer),
+                                      icon: const Icon(Icons.close),
+                                    ),
+                                    IconButton.filled(
+                                      tooltip: 'Approve',
+                                      onPressed: _busy
+                                          ? null
+                                          : () => _approvePeer(peer),
+                                      icon: const Icon(Icons.check),
+                                    ),
+                                  ],
+                                )
+                              : IconButton(
+                                  tooltip: 'Disconnect',
+                                  onPressed:
+                                      _busy ? null : () => _kickPeer(peer),
+                                  icon: const Icon(Icons.link_off),
+                                ),
+                        ),
+                      );
+                    }),
+                ],
                 const SizedBox(height: 20),
                 Text(
                   'Discovered hosts (${_devices.length})',

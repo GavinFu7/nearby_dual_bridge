@@ -20,8 +20,15 @@ bridge.addStatusListener((status) {
 final session = await bridge.startHost(
   deviceName: 'MacHost', // display name; an 8-char code is prepended automatically
   serviceUuid: BridgeConstants.defaultServiceUuid,
+  // requireConnectionApproval: true, // default — Host must approve Clients
 );
 print('Listening on ${session.wifi.host}:${session.wifi.port}');
+
+bridge.onHostPeersChanged.listen((peers) {
+  for (final peer in peers.where((p) => p.isPending)) {
+    // bridge.approvePeer(peer.id); // or rejectPeer / disconnectPeer
+  }
+});
 
 bridge
     .scanHosts(
