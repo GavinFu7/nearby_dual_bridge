@@ -8,6 +8,7 @@ void main() {
   runApp(const NearbyDualBridgeExampleApp());
 }
 
+/// 範例 App：示範 Nearby Dual Bridge 的 Host / Client 雙角色流程。
 class NearbyDualBridgeExampleApp extends StatelessWidget {
   const NearbyDualBridgeExampleApp({super.key});
 
@@ -28,6 +29,7 @@ class NearbyDualBridgeExampleApp extends StatelessWidget {
   }
 }
 
+/// 主頁面：可切換 Host / Client、掃描、連線與收發訊息。
 class BridgeHomePage extends StatefulWidget {
   const BridgeHomePage({super.key});
 
@@ -36,9 +38,13 @@ class BridgeHomePage extends StatefulWidget {
 }
 
 class _BridgeHomePageState extends State<BridgeHomePage> {
+  /// 核心橋接管理器：負責 Host、掃描、連線與訊息傳輸。
   final _bridge = DualBridgeManager();
-  // Display name only; package prepends a hidden 8-char correlation code.
+
+  /// 顯示用裝置名稱；套件會在內部再前置隱藏的 8 字元關聯碼。
   final _deviceNameController = TextEditingController(text: 'MacHost');
+
+  /// Host / Client 必須使用相同的 Service UUID 才能互相發現。
   final _serviceUuidController = TextEditingController(
     text: BridgeConstants.defaultServiceUuid,
   );
@@ -49,14 +55,23 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   BridgeRole _role = BridgeRole.idle;
   BridgeConnectionState _connectionState = BridgeConnectionState.disconnected;
   TransportType? _activeTransport;
+
+  /// 連線偏好：優先 Wi-Fi / BLE，或強制只用其中一種。
   ConnectionPreference _preference = ConnectionPreference.preferWifi;
 
   bool _hosting = false;
   bool _scanning = false;
+
+  /// 防止按鈕連點造成重複啟動 Host / Scan / Connect。
   bool _busy = false;
+
+  /// Client 掃描到的 Host 列表。
   List<BridgeDevice> _devices = const [];
+
+  /// Host 端目前的對等端（含待核准連線）。
   List<BridgePeer> _hostPeers = const [];
   BridgeDevice? _connectedDevice;
+
   StreamSubscription? _scanSub;
   StreamSubscription? _messageSub;
   StreamSubscription? _statusSub;
@@ -66,6 +81,8 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   @override
   void initState() {
     super.initState();
+
+    // 監聽橋接狀態變化（連線、斷線、Peer 核准等）。
     _statusSub = _bridge.addStatusListener((status) {
       final reason = status.reason;
       final logLine = switch (reason) {
@@ -96,6 +113,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
           _hosting = false;
           _hostPeers = const [];
         }
+        // Client 斷線後清掉目前連線裝置。
         if (status.connectionState == BridgeConnectionState.disconnected ||
             status.connectionState == BridgeConnectionState.disconnecting) {
           _connectedDevice = null;
@@ -109,15 +127,19 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
         }
       });
     });
+
+    // Host 端 Peer 列表更新（待核准 / 已連線）。
     _hostPeersSub = _bridge.onHostPeersChanged.listen((peers) {
       if (!mounted) return;
       setState(() => _hostPeers = peers);
     });
+
+    // 收到對端訊息時寫入 Log。
     _messageSub = _bridge.onMessageReceived.listen((message) {
       _appendLog('← $message');
     });
 
-    // Debug helpers:
+    // 除錯用自動流程：
     // flutter run -d macos --dart-define=AUTO_HOST=true
     // flutter run -d <iphone> --dart-define=AUTO_SCAN_WIFI=true
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -153,6 +175,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
 
   String get _deviceName => _deviceNameController.text.trim();
 
+  /// 將非同步操作包一層 busy 鎖，避免重入。
   Future<void> _runBusy(Future<void> Function() action) async {
     if (_busy) return;
     setState(() => _busy = true);
@@ -163,6 +186,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     }
   }
 
+  /// 切換 Host：啟動時同時開 Wi-Fi WebSocket 與 BLE 廣播。
   Future<void> _toggleHost() async {
     await _runBusy(() async {
       try {
@@ -176,6 +200,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
           _appendLog('Device name is required');
           return;
         }
+        // Host 與 Client 不可同時進行；先停掉掃描。
         await _stopScan();
         final session = await _bridge.startHost(
           deviceName: _deviceName,
@@ -205,6 +230,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     });
   }
 
+  /// 切換掃描；可分別啟用 Wi-Fi（mDNS）與 BLE。
   Future<void> _toggleScan({bool wifi = true, bool ble = true}) async {
     await _runBusy(() async {
       try {
@@ -232,6 +258,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
             .listen(
           (devices) {
             setState(() => _devices = devices);
+            // 只在發現數量改變時寫 Log，避免刷屏。
             if (devices.length != lastCount) {
               lastCount = devices.length;
               _appendLog('Found ${devices.length} host(s) [$mode]');
@@ -259,6 +286,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     }
   }
 
+  /// Client 連上指定 Host；會依 [_preference] 選擇傳輸方式。
   Future<void> _connect(BridgeDevice device) async {
     await _runBusy(() async {
       try {
@@ -268,7 +296,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
         if (!mounted) return;
         setState(() {
           _connectedDevice = device;
-          // Keep the connected Host visible after scan stops.
+          // 掃描停止後仍保留已連線 Host，方便 UI 顯示 Disconnect。
           if (!_devices.any((d) => d.id == device.id)) {
             _devices = [..._devices, device];
           }
@@ -299,6 +327,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     });
   }
 
+  /// Host 核准待連線 Peer，之後才能收發訊息。
   Future<void> _approvePeer(BridgePeer peer) async {
     try {
       await _bridge.approvePeer(peer.id);
@@ -317,6 +346,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
     }
   }
 
+  /// Host 主動踢除已連線 Peer。
   Future<void> _kickPeer(BridgePeer peer) async {
     try {
       await _bridge.disconnectPeer(peer.id);
@@ -331,6 +361,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
         _connectedDevice?.id == device.id;
   }
 
+  /// 送出簡單聊天 JSON；實際傳輸走目前啟用的 Wi-Fi 或 BLE。
   Future<void> _send() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
@@ -364,6 +395,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final width = MediaQuery.sizeOf(context).width;
+    // 寬螢幕限制內容寬度，避免輸入區過寬。
     final maxContentWidth = width >= 900 ? 720.0 : double.infinity;
 
     return GestureDetector(
@@ -407,6 +439,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
               controller: _scrollController,
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
               children: [
+                // 狀態總覽：角色、連線狀態、傳輸方式、Peer 數。
                 _StatusBanner(
                   role: _role,
                   connectionState: _connectionState,
@@ -435,6 +468,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                   ),
                 ),
                 const SizedBox(height: 16),
+                // Host / 掃描按鈕區。
                 Text('Mode', style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 8),
                 Wrap(
@@ -481,6 +515,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                   ),
                 ],
                 const SizedBox(height: 16),
+                // Client 連線偏好（Prefer Wi-Fi / Prefer BLE / Only）。
                 Text(
                   'Connection preference',
                   style: Theme.of(context).textTheme.titleMedium,
@@ -500,6 +535,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                       ),
                   ],
                 ),
+                // Host 端 Peer 管理：Approve / Reject / Kick。
                 if (_hosting) ...[
                   const SizedBox(height: 20),
                   Text(
@@ -562,6 +598,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                     }),
                 ],
                 const SizedBox(height: 20),
+                // Client 掃描結果與連線按鈕。
                 Text(
                   'Discovered hosts (${_devices.length})',
                   style: Theme.of(context).textTheme.titleMedium,
@@ -628,6 +665,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                     );
                   }),
                 const SizedBox(height: 20),
+                // 訊息收發區。
                 Text('Messages', style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 8),
                 Row(
@@ -651,6 +689,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
                   ],
                 ),
                 const SizedBox(height: 12),
+                // 事件與訊息 Log（最新在上）。
                 Text('Log', style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 8),
                 Card(
@@ -694,6 +733,7 @@ class _BridgeHomePageState extends State<BridgeHomePage> {
   }
 }
 
+/// 頂部狀態橫幅：顯示目前角色、連線與廣播／掃描狀態。
 class _StatusBanner extends StatelessWidget {
   const _StatusBanner({
     required this.role,
